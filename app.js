@@ -125,6 +125,7 @@ const STAGES = {
   PENDING_FOLLOWUP_2: "Pending for Follow-up 2",
   FOLLOWUP_DONE: "Follow-up Done",
   WAITING_RESPONSE: "Waiting for Response",
+  CHANCE: "Chance",
   PHOTO_RECEIVED: "Photo Received",
   JUNK: "Junk"
 };
@@ -135,6 +136,7 @@ const STAGE_META = {
   [STAGES.PENDING_FOLLOWUP_2]: { color: "#f97316", tone: "orange" },
   [STAGES.FOLLOWUP_DONE]: { color: "#8b5cf6", tone: "purple" },
   [STAGES.WAITING_RESPONSE]: { color: "#10b981", tone: "green" },
+  [STAGES.CHANCE]: { color: "#a855f7", tone: "purple" },
   [STAGES.PHOTO_RECEIVED]: { color: "#0f9aa8", tone: "teal" },
   [STAGES.JUNK]: { color: "#dc3545", tone: "red" }
 };
