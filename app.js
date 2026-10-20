@@ -175,7 +175,11 @@ const defaultDatabase = {
     followup2Days: 3,
     followup1TemplateName: null,
     followup2TemplateName: null,
-    followupTemplateMap: {}
+    followupTemplateMap: {},
+    autoInitialEnabled: false,
+    autoInitialAccountId: "primary",
+    autoInitialTemplateMap: {},
+    autoInitialQueue: []
   },
   connectedNumbers: [],
   pendingStatuses: {},
@@ -206,7 +210,7 @@ function normalizeDatabase(data) {
     templateConfigs: source.templateConfigs && typeof source.templateConfigs === "object" ? source.templateConfigs : {},
     events: Array.isArray(source.events) ? source.events : [],
     leads: normalizedLeads,
-    settings: { ...structuredClone(defaultDatabase.settings), ...(source.settings || {}), followupTemplateMap: (source.settings && source.settings.followupTemplateMap && typeof source.settings.followupTemplateMap === "object") ? source.settings.followupTemplateMap : {} },
+    settings: { ...structuredClone(defaultDatabase.settings), ...(source.settings || {}), followupTemplateMap: (source.settings && source.settings.followupTemplateMap && typeof source.settings.followupTemplateMap === "object") ? source.settings.followupTemplateMap : {}, autoInitialTemplateMap: (source.settings && source.settings.autoInitialTemplateMap && typeof source.settings.autoInitialTemplateMap === "object") ? source.settings.autoInitialTemplateMap : {}, autoInitialQueue: Array.isArray(source.settings?.autoInitialQueue) ? source.settings.autoInitialQueue : [] },
     connectedNumbers: Array.isArray(source.connectedNumbers) ? source.connectedNumbers : [],
     agents: Array.isArray(source.agents) ? source.agents : [],
     assignments: Array.isArray(source.assignments) ? source.assignments : [],
@@ -902,6 +906,105 @@ app.get("/api/countries",(req,res)=>{
   res.json({data:countries});
 });
 
+/* Bitrix new-lead automatic initial message */
+function bitrixLanguageLabel(value) {
+  const raw = String(value ?? "").trim();
+  return BITRIX_LANGUAGE_NAMES[raw] || raw;
+}
+function canonicalBitrixLanguage(value) { return getLeadLanguageKey(bitrixLanguageLabel(value)); }
+function initialQueueRecord(bitrixId) {
+  const queue = db.settings.autoInitialQueue || [];
+  return queue.find(x => String(x.bitrixId) === String(bitrixId) && x.type === "initial");
+}
+function updateInitialQueue(bitrixId, patch) {
+  db.settings.autoInitialQueue = Array.isArray(db.settings.autoInitialQueue) ? db.settings.autoInitialQueue : [];
+  let item = initialQueueRecord(bitrixId);
+  if (!item) { item = { id: makeId("initial"), type: "initial", bitrixId: String(bitrixId), createdAt: now(), attempts: 0 }; db.settings.autoInitialQueue.unshift(item); }
+  Object.assign(item, patch, { updatedAt: now() });
+  db.settings.autoInitialQueue = db.settings.autoInitialQueue.slice(0, 500);
+  saveDatabase(); return item;
+}
+async function getBitrixLead(id) {
+  if (!BITRIX_WEBHOOK_URL) throw new Error("BITRIX_WEBHOOK_URL is not configured");
+  const r = await fetch(`${BITRIX_WEBHOOK_URL}crm.item.get.json`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({entityTypeId:1,id:Number(id)}) });
+  const data = await r.json();
+  if (!r.ok || data.error) throw new Error(data.error_description || data.error || "Could not retrieve Bitrix lead");
+  return data.result?.item || null;
+}
+function extractBitrixPhone(b) {
+  const pf = b?.PHONE || b?.phone || [];
+  return Array.isArray(pf) ? (pf.find(x=>x.VALUE)?.VALUE || pf.find(x=>x.value)?.value || null) : (pf || null);
+}
+async function updateBitrixWaitingResponse(leadId) {
+  if (!BITRIX_WEBHOOK_URL) throw new Error("BITRIX_WEBHOOK_URL is not configured");
+  const r = await fetch(`${BITRIX_WEBHOOK_URL}crm.item.update.json`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({entityTypeId:1,id:Number(leadId),fields:{stageId:"STATUS:16"}}) });
+  const data = await r.json();
+  if (!r.ok || data.error) throw new Error(data.error_description || data.error || "WhatsApp accepted, but Bitrix stage update failed");
+  return data;
+}
+const autoInitialWorkers = new Set();
+async function processAutomaticInitialCore(bitrixId) {
+  const id = String(bitrixId || "").trim(); if (!id) return;
+  const existing = initialQueueRecord(id);
+  if (existing && ["sent","accepted","delivered","review_required","skipped","failed"].includes(existing.status)) return existing;
+  if (!db.settings.autoInitialEnabled) return updateInitialQueue(id,{status:"skipped",reason:"Automatic initial messaging is disabled."});
+  const accountId = db.settings.autoInitialAccountId === "secondary" ? "secondary" : "primary";
+  const leadItem = await getBitrixLead(id);
+  if (!leadItem) return updateInitialQueue(id,{status:"review_required",reason:"Bitrix lead was not found."});
+  const stage = String(leadItem.stageId || "");
+  if (stage && !["NEW","STATUS:NEW"].includes(stage)) return updateInitialQueue(id,{status:"skipped",reason:`Lead is no longer new (stage ${stage}); no message sent.`});
+  const phone = extractBitrixPhone(leadItem);
+  if (!phone) return updateInitialQueue(id,{status:"review_required",reason:"No phone number on Bitrix lead."});
+  const rawLanguage = leadItem.ufCrm_1690811363903 ?? "";
+  const languageLabel = bitrixLanguageLabel(rawLanguage);
+  const langKey = canonicalBitrixLanguage(rawLanguage);
+  const mapped = db.settings.autoInitialTemplateMap?.[langKey] || db.settings.autoInitialTemplateMap?.[languageLabel] || "";
+  if (!mapped) return updateInitialQueue(id,{status:"review_required",reason:`No initial template mapped for language: ${languageLabel || "blank"}.`,language:languageLabel,phone:cleanPhone(phone),name:leadItem.title||`Lead #${id}`});
+  const template = db.templates.find(t => (t.accountId || "primary") === accountId && String(t.name) === String(mapped) && String(t.status).toUpperCase()==="APPROVED" && canonicalBitrixLanguage(t.language)===langKey);
+  if (!template) return updateInitialQueue(id,{status:"review_required",reason:`Mapped template “${mapped}” is not approved or does not match the lead language under the selected number's WABA.`,language:languageLabel,phone:cleanPhone(phone),name:leadItem.title||`Lead #${id}`,accountId,templateName:mapped});
+  const current = initialQueueRecord(id);
+  if (current && current.status === "sending") return current;
+  updateInitialQueue(id,{status:"sending",reason:"Sending initial template.",language:languageLabel,phone:cleanPhone(phone),name:leadItem.title||`Lead #${id}`,accountId,templateName:template.name,attempts:Number(current?.attempts||0)+1});
+  try {
+    const result = await waAccountContext.run({accountId}, async()=>{
+      const components = buildTemplateComponents(template, {});
+      return sendTemplateMessage({to:phone,name:template.name,language:template.language,components,leadId:null,action:"auto_initial"});
+    });
+    const messageId = result?.messages?.[0]?.id || null;
+    updateInitialQueue(id,{status:"accepted",messageId,acceptedAt:now(),reason:"Meta accepted the message; updating Bitrix stage."});
+    // Never overwrite a stage changed manually while the message was in flight.
+    const latest = await getBitrixLead(id);
+    const latestStage = String(latest?.stageId || "");
+    if (!latest || (latestStage && !["NEW","STATUS:NEW"].includes(latestStage))) {
+      updateInitialQueue(id,{status:"accepted",reason:`Meta accepted the message. Bitrix stage was not changed because the lead is now at ${latestStage || "an unknown stage"}.`});
+      return initialQueueRecord(id);
+    }
+    await updateBitrixWaitingResponse(id);
+    updateInitialQueue(id,{status:"sent",reason:"Meta accepted the message and Bitrix was moved to Waiting for Response (STATUS_ID 16).",stageUpdated:true});
+    const localLead = createOrUpdateLead({bitrixId:Number(id),phone,name:leadItem.title||`Lead #${id}`,language:languageLabel,source:"Bitrix",createdAt:leadItem.dateCreate||now()});
+    if (localLead) { const accountState=leadAccountState(localLead,accountId); accountState.contactedAt=now(); if(accountId==="primary")localLead.contactedAt=accountState.contactedAt; saveDatabase(); }
+    addEvent("auto_initial_sent",{bitrixId:id,accountId,templateName:template.name,language:languageLabel,messageId,stageUpdated:true});
+    return initialQueueRecord(id);
+  } catch (error) {
+    const currentQueue=initialQueueRecord(id);
+    if(currentQueue?.messageId && ["accepted","sent","delivered","read"].includes(currentQueue.status)) {
+      updateInitialQueue(id,{status:"accepted",reason:`Meta already accepted the message (${currentQueue.messageId}); automatic resend is blocked. Follow up on the Bitrix stage manually if needed. ${error.message||""}`.trim(),stageUpdated:false});
+      addEvent("auto_initial_stage_update_failed",{bitrixId:id,accountId,messageId:currentQueue.messageId,error:error.message||"Unknown error"});
+      return initialQueueRecord(id);
+    }
+    updateInitialQueue(id,{status:"failed",reason:error.message||"Initial template send failed.",error:error.message||"Unknown error"});
+    addEvent("auto_initial_failed",{bitrixId:id,accountId,templateName:template.name,error:error.message||"Unknown error"});
+    return initialQueueRecord(id);
+  }
+}
+
+async function processAutomaticInitial(bitrixId) {
+  const key=String(bitrixId||"").trim(); if(!key)return;
+  if(autoInitialWorkers.has(key)) return initialQueueRecord(key);
+  autoInitialWorkers.add(key);
+  try { return await processAutomaticInitialCore(key); } finally { autoInitialWorkers.delete(key); }
+}
+
 /* Bitrix */
 app.get("/api/bitrix/test", async (req,res)=>{
   try {
@@ -972,6 +1075,33 @@ app.post("/api/bitrix/send-template", async (req,res)=>{
     const sentAt=now(); markContacted(lead,{messageId:result?.messages?.[0]?.id||null,templateName,sentAt},action==="initial");
     res.json({ok:true,leadId:Number(leadId),phone,contactedAt:lead.contactedAt,stage:lead.stage,followup1DueAt:lead.followup1DueAt,followup2DueAt:lead.followup2DueAt,whatsapp:result,template:tpl||null});
   } catch(e){res.status(e.status||500).json({ok:false,error:e.message,meta:e.meta||null});}
+});
+
+app.get("/api/auto-initial",(req,res)=>{const secret=process.env.BITRIX_AUTO_WEBHOOK_SECRET||"";res.json({success:true,webhookUrl:`${req.protocol}://${req.get("host")}/webhook/bitrix${secret?`?secret=${encodeURIComponent(secret)}`:""}`,webhookSecretConfigured:Boolean(secret),settings:{enabled:db.settings.autoInitialEnabled===true,accountId:db.settings.autoInitialAccountId||"primary",templateMap:db.settings.autoInitialTemplateMap||{}},queue:(db.settings.autoInitialQueue||[]).slice(0,200),templates:db.templates.filter(t=>(t.accountId||"primary")===(db.settings.autoInitialAccountId||"primary"))});});
+app.post("/api/auto-initial/settings",(req,res)=>{
+  const b=req.body||{};
+  if(Object.prototype.hasOwnProperty.call(b,"enabled"))db.settings.autoInitialEnabled=b.enabled===true||String(b.enabled).toLowerCase()==="true";
+  if(Object.prototype.hasOwnProperty.call(b,"accountId"))db.settings.autoInitialAccountId=b.accountId==="secondary"?"secondary":"primary";
+  if(b.templateMap&&typeof b.templateMap==="object") { const clean={}; for(const [k,v] of Object.entries(b.templateMap)) if(String(v||"").trim())clean[getLeadLanguageKey(k)]=String(v).trim(); db.settings.autoInitialTemplateMap=clean; }
+  saveDatabase(); res.json({success:true,settings:{enabled:db.settings.autoInitialEnabled,accountId:db.settings.autoInitialAccountId,templateMap:db.settings.autoInitialTemplateMap}});
+});
+app.post("/api/auto-initial/retry/:id",async(req,res)=>{try{const id=String(req.params.id);const q=initialQueueRecord(id);if(!q)return res.status(404).json({success:false,error:"Queue item not found"});if(["sent","accepted","delivered"].includes(q.status))return res.status(409).json({success:false,error:"This lead already has a message accepted by Meta; duplicate send blocked."});updateInitialQueue(id,{status:"pending",reason:"Manual retry requested."});const result=await processAutomaticInitial(id);res.json({success:true,data:result});}catch(e){res.status(500).json({success:false,error:e.message});}});
+app.post("/webhook/bitrix",async(req,res)=>{
+  const expected=process.env.BITRIX_AUTO_WEBHOOK_SECRET||"";
+  if(!expected)return res.status(503).send("Bitrix automatic webhook is not configured. Set BITRIX_AUTO_WEBHOOK_SECRET in the server environment.");
+  if(!safeEqual(String(req.query.secret||req.headers["x-bitrix-secret"]||""),expected))return res.sendStatus(403);
+  res.sendStatus(200);
+  try {
+    const body=req.body||{};
+    const event=String(body.event||body.EVENT||"").toUpperCase();
+    const data=body.data||body.DATA||{};
+    const id=data.FIELDS?.ID||data.fields?.ID||data.ID||data.id||body.ID;
+    if(id && (event.includes("ONCRMLEADADD")||event.includes("ONCRMLEADUPDATE")||event.includes("ONCRMITEMADD")||event.includes("ONCRMITEMUPDATE"))) {
+      const prior=initialQueueRecord(id);
+      if(!prior)updateInitialQueue(id,{status:"pending",reason:"New Bitrix lead event received."});
+      processAutomaticInitial(id).catch(e=>{console.error("Bitrix auto initial processing failed:",e.message);updateInitialQueue(id,{status:"failed",reason:e.message});});
+    }
+  } catch(e){console.error("Bitrix automation webhook error:",e.message);}
 });
 
 /* Templates */
@@ -1490,6 +1620,8 @@ function handleIncomingMessage(message,value,accountId=activeWhatsAppAccount().i
   saveDatabase();addEvent("incoming_message",{wa_id:phone,type:message.type,mediaId:media?.id||null});
 }
 function handleStatusUpdate(status){
+  const initialQueue=(db.settings.autoInitialQueue||[]).find(q=>q.messageId===status.id);
+  if(initialQueue){ const mapped=String(status.status||"").toLowerCase(); initialQueue.status=mapped==="failed"?"failed":mapped==="delivered"?"delivered":mapped==="read"?"read":initialQueue.status; initialQueue.statusUpdatedAt=now(); if(mapped==="failed")initialQueue.reason="WhatsApp delivery failed: "+JSON.stringify(status.errors||[]); saveDatabase(); }
   const message=db.messages.find(m=>m.wamid===status.id);
   if(message){
     applyStatusToMessage(message,status);
