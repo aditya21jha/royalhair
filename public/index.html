@@ -576,7 +576,7 @@ let templates=[], leads=[], contacts=[], conversations=[], statuses=[], countrie
 let selectedInboxChats=new Set();
 let leadSearchTimer=null;
 
-async function api(url,options={}){const agentId=localStorage.getItem("rh_agent_id")||"";const r=await fetch(url,{headers:{"Content-Type":"application/json",...(agentId?{"X-Agent-Id":agentId}:{}),...(options.headers||{})},...options});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||"Request failed");return d}
+async function api(url,options={}){const agentId=localStorage.getItem("rh_agent_id")||"";const accountId=localStorage.getItem("rh_whatsapp_account")||"primary";const r=await fetch(url,{headers:{"Content-Type":"application/json","X-WhatsApp-Account":accountId,...(agentId?{"X-Agent-Id":agentId}:{}),...(options.headers||{})},...options});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||"Request failed");return d}
 function esc(v){return String(v??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;")}
 function fmt(v){if(!v)return"—";try{return new Date(v).toLocaleString("en-GB",{dateStyle:"medium",timeStyle:"short"})}catch{return v}}
 function fmtDate(v){if(!v)return"—";try{return new Date(v).toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric"})}catch{return v}}
@@ -791,24 +791,26 @@ async function loadSettings(){try{const c=await api("/api/config"),s=await api("
 async function saveFollowupSettings(){try{const r=await api("/api/settings/followups",{method:"POST",body:JSON.stringify({automaticFollowupsEnabled:document.getElementById("automaticFollowupsEnabled").checked,followup1Days:document.getElementById("fu1Days").value,followup2Days:document.getElementById("fu2Days").value,followupTemplateMap:collectFollowupMapping()})});toast(`Settings saved. Automatic follow-ups ${r.data.automaticFollowupsEnabled?"ENABLED":"PAUSED"}. Sequence: +${r.data.followup1Days}d / +${r.data.followup2Days}d`);await loadSettings()}catch(e){toast(e.message,true)}}
 async function loadNumbers(){
   try{
-    const [d,c]=await Promise.all([api("/api/numbers"),api("/api/config")]);
-    const configured=Boolean(c.configured);
-    const status=String(c.whatsappStatus||"").toUpperCase();
-    const liveNumber=c.displayPhoneNumber||c.connectedNumber||d.active||d.data?.[0]?.number||"";
-    const ok=configured && status==="CONNECTED";
-    const label=ok ? `${liveNumber} · Connected` : (liveNumber ? `${liveNumber} · ${status||"Not connected"}` : "Number not configured");
-    document.getElementById("connectedNumber").textContent=label;
+    const d=await api("/api/whatsapp-accounts");
+    const accounts=d.data||[];
+    const selected=localStorage.getItem("rh_whatsapp_account")||"primary";
+    const current=accounts.find(a=>a.id===selected)||accounts[0];
+    if(current) document.getElementById("connectedNumber").textContent=current.number+" · "+(current.id==="primary"?"Existing":"Secondary");
     const dot=document.querySelector("#numberPicker .number-btn");
-    if(dot){dot.classList.toggle("number-online",ok);dot.classList.toggle("number-offline",!ok);}
-    document.getElementById("numberMenuList").innerHTML=`<div class="number-health">
-      <div><b>${esc(c.verifiedName||"Royal Hair WhatsApp")}</b><span>${esc(liveNumber||"No number")}</span></div>
-      <span class="badge ${ok?"badge-green":"badge-red"}">${esc(status||"NOT CONFIGURED")}</span>
-    </div>
-    <div class="number-details">Phone ID: ${esc(c.phoneNumberId||"—")}<br>WABA: ${esc(c.wabaId||"—")}<br>Platform: ${esc(c.platformType||"—")}</div>
-    ${(d.data||[]).map(n=>`<button onclick="selectNumber('${esc(n.number)}')">🟢 ${esc(n.number)}<br><span class="hint">${esc(n.label)}</span></button>`).join("")||`<div class="hint" style="padding:10px">No additional numbers configured.</div>`}`;
+    if(dot){dot.classList.toggle("number-online",Boolean(current?.configured));dot.classList.toggle("number-offline",!current?.configured);}
+    document.getElementById("numberMenuList").innerHTML=accounts.map(a=>`<button class="number-account-option" style="display:flex;width:100%;text-align:left;gap:10px;align-items:center;padding:12px;border:0;border-radius:10px;background:${a.id===selected?'#e8f5ff':'transparent'};color:#163047;cursor:pointer" onclick="selectNumber('${a.id}')"><span style="font-size:20px">💬</span><span><b>${esc(a.label)}</b><br><span class="hint">${esc(a.number)} · ${a.configured?'Configured':'Check configuration'}</span></span>${a.id===selected?'<span style="margin-left:auto">✓</span>':''}</button>`).join("");
   }catch(e){document.getElementById("connectedNumber").textContent="Number status unavailable";}
 }
-function selectNumber(n){document.getElementById("connectedNumber").textContent=n;document.getElementById("numberPicker").classList.remove("open");toast("Number selected in the interface. API switching will be connected during Coexistence setup.")}
+function selectNumber(accountId){
+  if(!["primary","secondary"].includes(accountId))return;
+  localStorage.setItem("rh_whatsapp_account",accountId);
+  document.getElementById("numberPicker").classList.remove("open");
+  const chatList=document.getElementById("conversationList");if(chatList)chatList.innerHTML='<div class="empty-state">Switching WhatsApp account…</div>';
+  selectedConversation=null;conversations=[];currentMessagingWindow=null;
+  loadNumbers();
+  loadDashboard();loadInbox();loadTemplates();loadCampaigns();
+  toast("Switched to "+(accountId==="secondary"?"6688":"5788"));
+}
 function openAddNumber(){openModal("Add WhatsApp number",`<div class="field"><label>Phone number</label><input id="newNumber" placeholder="+90…"></div><div class="field"><label>Label</label><input id="newNumberLabel" placeholder="Royal Hair Production"></div><button class="btn btn-primary" onclick="addNumber()">Save number</button>`)}
 async function addNumber(){try{await api("/api/numbers",{method:"POST",body:JSON.stringify({number:document.getElementById("newNumber").value,label:document.getElementById("newNumberLabel").value})});closeModal();loadNumbers();toast("Number saved to the selector")}catch(e){toast(e.message,true)}}
 
@@ -952,4 +954,10 @@ initialize();
 #section-inbox .message-bubble.outgoing{background:linear-gradient(135deg,#d8f7e9,#c8f0e1)!important;color:#143d36!important}
 #section-inbox .message-bubble.incoming{background:#fff!important;color:#1b3447!important}
 @media(max-width:700px){#section-inbox .chat-composer{padding:9px!important}}
+</style>
+
+<style>
+#chatText,#chatText:focus,#chatText::placeholder{color:#172b3b!important}
+#chatText{background:#fff!important;border:1px solid #cbd5e1!important;caret-color:#172b3b!important}
+.number-account-option:hover{background:#edf6ff!important}
 </style>
