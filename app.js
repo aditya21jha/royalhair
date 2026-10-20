@@ -1005,6 +1005,54 @@ async function processAutomaticInitial(bitrixId) {
   try { return await processAutomaticInitialCore(key); } finally { autoInitialWorkers.delete(key); }
 }
 
+/* Bitrix scheduled polling fallback: does not require an outgoing event permission. */
+let bitrixPollRunning = false;
+async function bitrixLeadList(params = {}) {
+  if (!BITRIX_WEBHOOK_URL) throw new Error("BITRIX_WEBHOOK_URL is not configured");
+  const r = await fetch(`${BITRIX_WEBHOOK_URL}crm.lead.list.json`, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({order:{ID:"ASC"},filter:params.filter||{},select:["ID","TITLE","DATE_CREATE","STATUS_ID","PHONE","UF_CRM_1690811363903"],start:0})});
+  const data = await r.json();
+  if (!r.ok || data.error) throw new Error(data.error_description || data.error || "Could not poll Bitrix leads");
+  return Array.isArray(data.result) ? data.result : [];
+}
+async function pollBitrixForNewLeads() {
+  if (bitrixPollRunning || !db || !BITRIX_WEBHOOK_URL || !db.settings.autoInitialEnabled) return;
+  bitrixPollRunning = true;
+  try {
+    const cursor = Number(db.settings.autoInitialLastSeenLeadId || 0);
+    // First run establishes a baseline so historical CRM leads are not messaged unexpectedly.
+    if (!db.settings.autoInitialPollingInitialized) {
+      const existing = await bitrixLeadList();
+      const maxId = existing.reduce((max, lead) => Math.max(max, Number(lead.ID || 0)), cursor);
+      db.settings.autoInitialLastSeenLeadId = maxId;
+      db.settings.autoInitialPollingInitialized = true;
+      db.settings.autoInitialLastPollAt = now();
+      db.settings.autoInitialLastPollError = "";
+      saveDatabase();
+      console.log(`[BITRIX POLLING] Baseline established at lead ID ${maxId}; only newer leads will be processed.`);
+      return;
+    }
+    const leads = await bitrixLeadList({filter:{">ID":cursor}});
+    let latest = cursor;
+    for (const lead of leads.sort((a,b)=>Number(a.ID)-Number(b.ID))) {
+      const id = String(lead.ID || "").trim();
+      if (!id) continue;
+      latest = Math.max(latest, Number(id));
+      if (!initialQueueRecord(id)) updateInitialQueue(id,{status:"pending",reason:"New Bitrix lead detected by scheduled polling."});
+      await processAutomaticInitial(id);
+    }
+    db.settings.autoInitialLastSeenLeadId = latest;
+    db.settings.autoInitialLastPollAt = now();
+    db.settings.autoInitialLastPollError = "";
+    saveDatabase();
+  } catch (error) {
+    db.settings.autoInitialLastPollAt = now();
+    db.settings.autoInitialLastPollError = error.message || "Unknown Bitrix polling error";
+    saveDatabase();
+    console.error("[BITRIX POLLING] Failed:", error.message);
+  } finally { bitrixPollRunning = false; }
+}
+app.post("/api/auto-initial/poll-now",async(req,res)=>{try{await pollBitrixForNewLeads();res.json({success:!db.settings.autoInitialLastPollError,error:db.settings.autoInitialLastPollError||null,polling:{lastPollAt:db.settings.autoInitialLastPollAt||null,cursor:db.settings.autoInitialLastSeenLeadId||null}});}catch(e){res.status(500).json({success:false,error:e.message});}});
+
 /* Bitrix */
 app.get("/api/bitrix/test", async (req,res)=>{
   try {
@@ -1077,7 +1125,7 @@ app.post("/api/bitrix/send-template", async (req,res)=>{
   } catch(e){res.status(e.status||500).json({ok:false,error:e.message,meta:e.meta||null});}
 });
 
-app.get("/api/auto-initial",(req,res)=>{const secret=process.env.BITRIX_AUTO_WEBHOOK_SECRET||"";res.json({success:true,webhookUrl:`${req.protocol}://${req.get("host")}/webhook/bitrix${secret?`?secret=${encodeURIComponent(secret)}`:""}`,webhookSecretConfigured:Boolean(secret),settings:{enabled:db.settings.autoInitialEnabled===true,accountId:db.settings.autoInitialAccountId||"primary",templateMap:db.settings.autoInitialTemplateMap||{}},queue:(db.settings.autoInitialQueue||[]).slice(0,200),templates:db.templates.filter(t=>(t.accountId||"primary")===(db.settings.autoInitialAccountId||"primary"))});});
+app.get("/api/auto-initial",(req,res)=>{const secret=process.env.BITRIX_AUTO_WEBHOOK_SECRET||"";res.json({success:true,webhookUrl:`${req.protocol}://${req.get("host")}/webhook/bitrix${secret?`?secret=${encodeURIComponent(secret)}`:""}`,webhookSecretConfigured:Boolean(secret),polling:{enabled:true,intervalSeconds:60,lastPollAt:db.settings.autoInitialLastPollAt||null,lastError:db.settings.autoInitialLastPollError||null,cursor:db.settings.autoInitialLastSeenLeadId||null},settings:{enabled:db.settings.autoInitialEnabled===true,accountId:db.settings.autoInitialAccountId||"primary",templateMap:db.settings.autoInitialTemplateMap||{}},queue:(db.settings.autoInitialQueue||[]).slice(0,200),templates:db.templates.filter(t=>(t.accountId||"primary")===(db.settings.autoInitialAccountId||"primary"))});});
 app.post("/api/auto-initial/settings",(req,res)=>{
   const b=req.body||{};
   if(Object.prototype.hasOwnProperty.call(b,"enabled"))db.settings.autoInitialEnabled=b.enabled===true||String(b.enabled).toLowerCase()==="true";
@@ -1788,6 +1836,9 @@ async function startServer() {
   console.log(`[STARTUP] Database loaded: contacts=${db.contacts.length}, leads=${db.leads.length}, messages=${db.messages.length}`);
   for (const accountId of Object.keys(WA_ACCOUNTS)) void waAccountContext.run({accountId},()=>processLeadTimers());
   setInterval(() => { for (const accountId of Object.keys(WA_ACCOUNTS)) void waAccountContext.run({accountId},()=>processLeadTimers()); }, 30000);
+  // Poll every 60 seconds while automatic initial messaging is enabled.
+  setTimeout(() => void pollBitrixForNewLeads(), 5000);
+  setInterval(() => void pollBitrixForNewLeads(), 60000);
   appReady = true;
   app.listen(PORT,"0.0.0.0",()=>{
     console.log(`Royal Hair WhatsApp Dashboard running on port ${PORT}`);
