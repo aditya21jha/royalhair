@@ -85,7 +85,7 @@ app.use((req, res, next) => {
   if (/^\/[^?]*\.(?:jpe?g|png|webp|gif)$/i.test(req.path)) return next();
 
   // Meta must be able to reach its webhook without an interactive dashboard session.
-  if (req.path === "/webhook" || req.path === "/login" || req.path === "/auth/login" || req.path === "/auth/logout") return next();
+  if (req.path === "/webhook" || req.path === "/webhook/bitrix" || req.path === "/login" || req.path === "/auth/login" || req.path === "/auth/logout") return next();
   if (!appReady && !req.path.startsWith("/webhook")) return res.status(503).json({ ok: false, error: "Application is starting. Please retry in a moment." });
   if (!hasValidSession(req)) {
     if (req.path.startsWith("/api/")) return res.status(401).json({ error: "Authentication required.", login: "/login" });
