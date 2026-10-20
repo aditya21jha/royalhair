@@ -37,3 +37,8 @@ Keep existing variables unchanged, including `DATABASE_URL`, `WHATSAPP_TOKEN`, `
 - IMPORTANT: In Meta, subscribe the same app to BOTH WABAs. The existing callback URL and verify token stay the same. Verify each WABA's `/{WABA_ID}/subscribed_apps` includes your app before testing inbound messages.
 - If the System User token does not actually have access to the second WABA, API calls for 6688 will fail; do not replace the existing token until permissions are checked.
 - Test one outbound template and one inbound reply per number before using broadcasts. The code has passed local syntax checks but has not been live-tested against Meta or Bitrix.
+- Lead funnel stages, follow-up timestamps, and opt-out state are now stored per WhatsApp account; the same Bitrix lead identity/record is shared between accounts.
+- Contact labels are scoped per selected WhatsApp account. Label-based campaigns use labels from the selected account, and campaign history is filtered by account.
+- Campaign records store the account that started them, so queued sends and campaign resumes use that account's Phone Number ID.
+- Template cache entries and template media configuration are keyed per account/WABA to avoid collisions when template names overlap.
+- Existing lead funnel state is treated as the primary (5788) account's state during migration. Secondary (6688) starts with its own empty funnel state.

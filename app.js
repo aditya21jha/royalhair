@@ -297,6 +297,11 @@ function getContact(phone) {
   const normalized = cleanPhone(phone);
   return db.contacts.find(c => cleanPhone(c.wa_id || c.phone) === normalized);
 }
+function contactLabelsForAccount(contact, accountId = activeWhatsAppAccount().id) {
+  contact.labelsByAccount = contact.labelsByAccount && typeof contact.labelsByAccount === "object" ? contact.labelsByAccount : {};
+  if (!Array.isArray(contact.labelsByAccount[accountId])) contact.labelsByAccount[accountId] = accountId === "primary" ? (Array.isArray(contact.labels) ? contact.labels : []) : [];
+  return contact.labelsByAccount[accountId];
+}
 function upsertContact(data) {
   const phone = cleanPhone(data.wa_id || data.phone);
   if (!phone) return null;
@@ -392,6 +397,27 @@ function stageColor(stage) { return STAGE_META[stage]?.color || "#64748b"; }
 function addDays(iso, days) {
   return new Date(new Date(iso).getTime() + Number(days || 0) * 86400000).toISOString();
 }
+function leadAccountState(lead, accountId = activeWhatsAppAccount().id) {
+  if (!lead) return {};
+  lead.whatsappStates = lead.whatsappStates && typeof lead.whatsappStates === "object" ? lead.whatsappStates : {};
+  if (!lead.whatsappStates[accountId]) {
+    // Migrate the existing funnel into the original (primary) account only.
+    lead.whatsappStates[accountId] = accountId === "primary" ? {
+      stage: lead.stage || null, stageHistory: Array.isArray(lead.stageHistory) ? lead.stageHistory : [],
+      contactedAt: lead.contactedAt || null, followup1DueAt: lead.followup1DueAt || null,
+      followup1SentAt: lead.followup1SentAt || null, followup2DueAt: lead.followup2DueAt || null,
+      followup2SentAt: lead.followup2SentAt || null, optOut: !!lead.optOut
+    } : { stage: null, stageHistory: [], contactedAt: null, followup1DueAt: null, followup1SentAt: null, followup2DueAt: null, followup2SentAt: null, optOut: false };
+  }
+  return lead.whatsappStates[accountId];
+}
+function leadStage(lead, accountId = activeWhatsAppAccount().id) { return leadAccountState(lead, accountId).stage || null; }
+function leadOptedOut(lead, accountId = activeWhatsAppAccount().id) { return !!leadAccountState(lead, accountId).optOut; }
+function leadForAccount(lead, accountId = activeWhatsAppAccount().id) {
+  if (!lead) return null;
+  const state = leadAccountState(lead, accountId);
+  return { ...lead, ...state, whatsappStates: undefined, accountId };
+}
 function leadForPhone(phone) {
   const p = cleanPhone(phone);
   return db.leads.find(l => cleanPhone(l.phone) === p);
@@ -437,31 +463,29 @@ function createOrUpdateLead(data = {}) {
 }
 function setLeadStage(lead, stage, reason = "manual") {
   if (!lead) return null;
-  if (lead.stage !== stage) {
-    lead.stage = stage;
-    lead.stageHistory = Array.isArray(lead.stageHistory) ? lead.stageHistory : [];
-    lead.stageHistory.push({ stage, at: now(), reason });
-    if (lead.stageHistory.length > 100) lead.stageHistory = lead.stageHistory.slice(-100);
+  const accountId = activeWhatsAppAccount().id;
+  const state = leadAccountState(lead, accountId);
+  if (state.stage !== stage) {
+    state.stage = stage;
+    state.stageHistory = Array.isArray(state.stageHistory) ? state.stageHistory : [];
+    state.stageHistory.push({ stage, at: now(), reason });
+    if (state.stageHistory.length > 100) state.stageHistory = state.stageHistory.slice(-100);
   }
-  lead.updatedAt = now();
-  saveDatabase();
-  addEvent("lead_stage_changed", { leadId: lead.id, phone: lead.phone, stage, reason });
+  if (accountId === "primary") {
+    lead.stage = state.stage; lead.stageHistory = state.stageHistory;
+    for (const key of ["contactedAt","followup1DueAt","followup1SentAt","followup2DueAt","followup2SentAt","optOut"]) if (state[key] !== undefined) lead[key] = state[key];
+  }
+  lead.updatedAt = now(); saveDatabase();
+  addEvent("lead_stage_changed", { leadId: lead.id, phone: lead.phone, stage, reason, accountId });
   return lead;
 }
+
 function scheduleAfterInitial(lead, contactedAt) {
-  lead.contactedAt = contactedAt;
-  lead.followup1DueAt = addDays(contactedAt, db.settings.followup1Days);
-  lead.followup1SentAt = null;
-  lead.followup2DueAt = null;
-  lead.followup2SentAt = null;
+  const state=leadAccountState(lead); state.contactedAt=contactedAt; state.followup1DueAt=addDays(contactedAt,db.settings.followup1Days); state.followup1SentAt=null; state.followup2DueAt=null; state.followup2SentAt=null;
+  if(activeWhatsAppAccount().id==="primary") for(const k of ["contactedAt","followup1DueAt","followup1SentAt","followup2DueAt","followup2SentAt"]) lead[k]=state[k];
 }
-function scheduleAfterFollowup1(lead, sentAt) {
-  lead.followup1SentAt = sentAt;
-  lead.followup2DueAt = addDays(sentAt, db.settings.followup2Days);
-}
-function scheduleAfterFollowup2(lead, sentAt) {
-  lead.followup2SentAt = sentAt;
-}
+function scheduleAfterFollowup1(lead, sentAt) { const state=leadAccountState(lead); state.followup1SentAt=sentAt; state.followup2DueAt=addDays(sentAt,db.settings.followup2Days); if(activeWhatsAppAccount().id==="primary"){lead.followup1SentAt=state.followup1SentAt;lead.followup2DueAt=state.followup2DueAt;} }
+function scheduleAfterFollowup2(lead, sentAt) { const state=leadAccountState(lead); state.followup2SentAt=sentAt; if(activeWhatsAppAccount().id==="primary")lead.followup2SentAt=sentAt; }
 
 const leadFollowupWorkers = new Set();
 function normalizeTemplateLanguageForLead(value) {
@@ -503,7 +527,7 @@ function stopFailedAutomaticFollowup(lead, action, details = {}) {
 
 async function sendAutomaticFollowup(lead, action) {
   if (!db.settings.automaticFollowupsEnabled) return false;
-  if (!lead || lead.optOut || lead.stage === STAGES.JUNK || lead.stage === STAGES.PHOTO_RECEIVED || lead.stage === STAGES.WAITING_RESPONSE) return false;
+  if (!lead || leadOptedOut(lead) || [STAGES.JUNK,STAGES.PHOTO_RECEIVED,STAGES.WAITING_RESPONSE].includes(leadStage(lead))) return false;
   const template = resolveAutomaticFollowupTemplate(action, lead);
   if (!template) {
     addEvent("followup_template_missing", { leadId: lead.id, phone: lead.phone, action, language: lead.language || "", reason: "No explicit language × follow-up template mapping or mapped template is not approved." });
@@ -536,44 +560,38 @@ async function sendAutomaticFollowup(lead, action) {
 
 function markContacted(lead, messageMeta, isInitial = false) {
   const sentAt = messageMeta.sentAt || now();
-  if (isInitial || !lead.contactedAt) {
+  const state = leadAccountState(lead);
+  if (isInitial || !state.contactedAt) {
     scheduleAfterInitial(lead, sentAt);
     setLeadStage(lead, STAGES.CONTACTED, "initial_message_sent");
-  } else if (!lead.followup1SentAt) {
+  } else if (!state.followup1SentAt) {
     scheduleAfterFollowup1(lead, sentAt);
     setLeadStage(lead, STAGES.FOLLOWUP_DONE, "followup_1_sent");
-  } else if (!lead.followup2SentAt) {
+  } else if (!state.followup2SentAt) {
     scheduleAfterFollowup2(lead, sentAt);
     setLeadStage(lead, STAGES.WAITING_RESPONSE, "followup_2_sent");
   } else {
     setLeadStage(lead, STAGES.WAITING_RESPONSE, "followup_sequence_completed");
   }
-  lead.lastMessageAt = sentAt;
-  lead.lastTemplate = messageMeta.templateName || null;
-  lead.lastMessageId = messageMeta.messageId || null;
-  lead.updatedAt = sentAt;
-  saveDatabase();
+  if (activeWhatsAppAccount().id === "primary") {
+    lead.contactedAt=state.contactedAt; lead.followup1DueAt=state.followup1DueAt; lead.followup1SentAt=state.followup1SentAt; lead.followup2DueAt=state.followup2DueAt; lead.followup2SentAt=state.followup2SentAt;
+  }
+  lead.lastMessageAt = sentAt; lead.lastTemplate = messageMeta.templateName || null; lead.lastMessageId = messageMeta.messageId || null; lead.updatedAt = sentAt; saveDatabase();
 }
 async function processLeadTimers() {
-  // Automatic follow-ups are opt-in and remain paused by default.
   if (!db || !Array.isArray(db.leads) || !db.settings?.automaticFollowupsEnabled) return;
-  const t = Date.now();
+  const t = Date.now(), accountId=activeWhatsAppAccount().id;
   for (const lead of db.leads) {
-    if (lead.optOut || lead.stage === STAGES.JUNK || lead.stage === STAGES.PHOTO_RECEIVED || lead.stage === STAGES.WAITING_RESPONSE) continue;
-    if (leadFollowupWorkers.has(lead.id)) continue;
-
-    const followup1Due = lead.contactedAt && !lead.followup1SentAt && lead.followup1DueAt && new Date(lead.followup1DueAt).getTime() <= t;
-    const followup2Due = lead.followup1SentAt && !lead.followup2SentAt && lead.followup2DueAt && new Date(lead.followup2DueAt).getTime() <= t;
-    if (!followup1Due && !followup2Due) continue;
-
-    leadFollowupWorkers.add(lead.id);
-    try {
-      const action = followup1Due ? "followup1" : "followup2";
-      setLeadStage(lead, action === "followup1" ? STAGES.PENDING_FOLLOWUP_1 : STAGES.PENDING_FOLLOWUP_2, action === "followup1" ? "followup_1_due" : "followup_2_due");
-      await sendAutomaticFollowup(lead, action);
-    } finally {
-      leadFollowupWorkers.delete(lead.id);
-    }
+    const state=leadAccountState(lead,accountId);
+    if (state.optOut || state.stage===STAGES.JUNK || state.stage===STAGES.PHOTO_RECEIVED || state.stage===STAGES.WAITING_RESPONSE) continue;
+    const workerKey=`${accountId}:${lead.id}`;
+    if (leadFollowupWorkers.has(workerKey)) continue;
+    const followup1Due=state.contactedAt&&!state.followup1SentAt&&state.followup1DueAt&&new Date(state.followup1DueAt).getTime()<=t;
+    const followup2Due=state.followup1SentAt&&!state.followup2SentAt&&state.followup2DueAt&&new Date(state.followup2DueAt).getTime()<=t;
+    if(!followup1Due&&!followup2Due)continue;
+    leadFollowupWorkers.add(workerKey);
+    try { const action=followup1Due?"followup1":"followup2"; setLeadStage(lead,action==="followup1"?STAGES.PENDING_FOLLOWUP_1:STAGES.PENDING_FOLLOWUP_2,action==="followup1"?"followup_1_due":"followup_2_due"); await sendAutomaticFollowup(lead,action); }
+    finally { leadFollowupWorkers.delete(workerKey); }
   }
 }
 
@@ -664,7 +682,8 @@ function getTemplateConfigKey(template) {
   return `${activeWhatsAppAccount().id}::${template?.name || ""}::${template?.language || ""}`;
 }
 function templateByKey(name, language) {
-  return db.templates.find(t => t.name === name && t.language === language);
+  const accountId = activeWhatsAppAccount().id;
+  return db.templates.find(t => t.name === name && t.language === language && (t.accountId || "primary") === accountId);
 }
 function getTemplateConfig(template) {
   return db.templateConfigs[getTemplateConfigKey(template)] || {};
@@ -961,15 +980,17 @@ async function fetchAllTemplates(){
   let url=`/${activeWhatsAppAccount().wabaId}/message_templates?fields=id,name,status,category,language,components,quality_score&limit=100`;
   const all=[]; let pages=0;
   while(url&&pages<20){const data=await metaRequest(url); if(Array.isArray(data.data)) all.push(...data.data); url=data?.paging?.next?data.paging.next.replace(GRAPH_URL,""):null; pages++;}
-  db.templates=all; saveDatabase(); addEvent("templates_synced",{count:all.length}); return all;
+  const accountId=activeWhatsAppAccount().id;
+  db.templates=[...db.templates.filter(t=>(t.accountId||"primary")!==accountId),...all.map(t=>({...t,accountId}))];
+  saveDatabase(); addEvent("templates_synced",{count:all.length,accountId}); return all;
 }
-app.get("/api/templates",async(req,res)=>{try{const data=await fetchAllTemplates();res.json({success:true,data});}catch(e){res.status(e.status||500).json({success:false,error:e.message,meta:e.meta||null,cached:db.templates});}});
+app.get("/api/templates",async(req,res)=>{try{const data=await fetchAllTemplates();res.json({success:true,data});}catch(e){res.status(e.status||500).json({success:false,error:e.message,meta:e.meta||null,cached:db.templates.filter(t=>(t.accountId||"primary")===activeWhatsAppAccount().id)});}});
 app.post("/api/templates/sync",async(req,res)=>{try{const data=await fetchAllTemplates();res.json({success:true,count:data.length,data});}catch(e){res.status(e.status||500).json({success:false,error:e.message,meta:e.meta||null});}});
 app.get("/api/templates/config",(req,res)=>res.json({data:db.templateConfigs}));
 app.post("/api/templates/config",(req,res)=>{
   const {name,language,mediaUrl}=req.body||{};
   if(!name||!language) return res.status(400).json({error:"Template name and language are required."});
-  const key=`${name}::${language}`;
+  const key=`${activeWhatsAppAccount().id}::${name}::${language}`;
   db.templateConfigs[key]={mediaUrl:String(mediaUrl||"").trim(),updatedAt:now()};
   saveDatabase(); res.json({success:true,data:db.templateConfigs[key]});
 });
@@ -980,7 +1001,7 @@ app.get("/api/templates/:name/:language/meta",(req,res)=>{
 });
 
 /* Contacts / labels */
-app.get("/api/contacts",(req,res)=>res.json({data:db.contacts}));
+app.get("/api/contacts",(req,res)=>res.json({data:db.contacts.map(c=>({...c,labels:contactLabelsForAccount(c)})),accountId:activeWhatsAppAccount().id}));
 app.post("/api/contacts/import",(req,res)=>{
   try{
     const contacts=Array.isArray(req.body?.contacts)?req.body.contacts:[]; const label=String(req.body?.label||"").trim();
@@ -988,11 +1009,11 @@ app.post("/api/contacts/import",(req,res)=>{
     contacts.forEach(item=>{
       const phone=cleanPhone(item.phone||item.number||item.wa_id); if(!phone)return;
       const existing=getContact(phone);
-      const contact=upsertContact({...item,phone,wa_id:phone,labels:label?[label]:[]});
+      const contact=upsertContact({...item,phone,wa_id:phone,labels:[]});
       if(existing)updated++; else if(contact)imported++;
-      if(label&&contact&&!contact.labels.includes(label))contact.labels.push(label);
+      if(contact){const accountLabels=contactLabelsForAccount(contact);if(label&&!accountLabels.includes(label))accountLabels.push(label);if(activeWhatsAppAccount().id==="primary")contact.labels=accountLabels;}
     });
-    saveDatabase(); res.json({success:true,imported,updated,total:imported+updated,label});
+    saveDatabase(); res.json({success:true,imported,updated,total:imported+updated,label,accountId:activeWhatsAppAccount().id});
   }catch(e){res.status(500).json({success:false,error:e.message});}
 });
 app.post("/api/leads/import-contacts",(req,res)=>{
@@ -1000,7 +1021,7 @@ app.post("/api/leads/import-contacts",(req,res)=>{
     const contactIds=Array.isArray(req.body?.contactIds)?req.body.contactIds:[];
     const label=String(req.body?.label||"").trim();
     let added=0,updated=0,skipped=0;
-    let selected=contactIds.length ? db.contacts.filter(c=>contactIds.includes(c.id)) : db.contacts.filter(c=>label&&(c.labels||[]).includes(label));
+    let selected=contactIds.length ? db.contacts.filter(c=>contactIds.includes(c.id)) : db.contacts.filter(c=>label&&contactLabelsForAccount(c).includes(label));
     selected.forEach(contact=>{
       const phone=cleanPhone(contact.phone||contact.wa_id);
       if(!phone){skipped++;return;}
@@ -1015,7 +1036,7 @@ app.post("/api/leads/import-contacts",(req,res)=>{
         lead=createOrUpdateLead({phone,name:contact.name||phone,language:contact.language||"",source:"Contact Import",contactId:contact.id});
         added++;
       }
-      if(lead.optOut||lead.stage===STAGES.JUNK){skipped++;return;}
+      if(leadOptedOut(lead)||leadStage(lead)===STAGES.JUNK){skipped++;return;}
       const contactedAt=lead.contactedAt||now();
       if(!lead.contactedAt) scheduleAfterInitial(lead,contactedAt);
       setLeadStage(lead,STAGES.CONTACTED,"contact_import");
@@ -1028,18 +1049,17 @@ app.post("/api/leads/import-contacts",(req,res)=>{
   }catch(e){res.status(500).json({success:false,error:e.message});}
 });
 app.get("/api/contacts/labels",(req,res)=>{
-  const counts={};
-  db.contacts.forEach(c=>(c.labels||[]).forEach(l=>counts[l]=(counts[l]||0)+1));
-  res.json({data:Object.entries(counts).map(([name,count])=>({name,count}))});
+  const counts={}; db.contacts.forEach(c=>contactLabelsForAccount(c).forEach(l=>counts[l]=(counts[l]||0)+1));
+  res.json({data:Object.entries(counts).map(([name,count])=>({name,count})),accountId:activeWhatsAppAccount().id});
 });
 app.delete("/api/contacts/labels",(req,res)=>{
   const label=String(req.query?.name||req.body?.name||"").trim();
   if(!label) return res.status(400).json({success:false,error:"Label name is required."});
   let removed=0;
   db.contacts.forEach(contact=>{
-    const before=Array.isArray(contact.labels)?contact.labels:[];
+    const before=contactLabelsForAccount(contact);
     const after=before.filter(item=>String(item)!==label);
-    if(after.length!==before.length){contact.labels=after;contact.updatedAt=now();removed += before.length-after.length;}
+    if(after.length!==before.length){contact.labelsByAccount[activeWhatsAppAccount().id]=after;if(activeWhatsAppAccount().id==="primary")contact.labels=after;contact.updatedAt=now();removed += before.length-after.length;}
   });
   saveDatabase();
   addEvent("contact_label_deleted",{label,removed});
@@ -1062,46 +1082,47 @@ app.post("/api/lists/:listId/contacts",(req,res)=>{
 /* Leads */
 app.get("/api/leads",(req,res)=>{
   processLeadTimers();
-  let leads=[...db.leads];
+  let leads=db.leads.map(l=>leadForAccount(l));
   if(req.query.stage) leads=leads.filter(l=>l.stage===req.query.stage);
   if(req.query.language) leads=leads.filter(l=>String(l.language||"").toLowerCase()===String(req.query.language).toLowerCase());
   if(req.query.q){const q=String(req.query.q).toLowerCase();leads=leads.filter(l=>[l.name,l.phone,l.language,l.bitrixId].some(v=>String(v||"").toLowerCase().includes(q)));}
   if(req.query.from) leads=leads.filter(l=>new Date(l.createdAt)>=new Date(`${req.query.from}T00:00:00`));
   if(req.query.to) leads=leads.filter(l=>new Date(l.createdAt)<=new Date(`${req.query.to}T23:59:59`));
   leads.sort((a,b)=>new Date(b.updatedAt||b.createdAt)-new Date(a.updatedAt||a.createdAt));
-  res.json({data:leads,stageMeta:STAGE_META,stages:Object.values(STAGES)});
+  res.json({data:leads,stageMeta:STAGE_META,stages:Object.values(STAGES),accountId:activeWhatsAppAccount().id});
 });
 app.get("/api/leads/stats",(req,res)=>{
   processLeadTimers();
-  const total=db.leads.filter(l=>l.stage&&l.stage!==STAGES.JUNK).length;
-  const stats={};Object.values(STAGES).forEach(s=>stats[s]=db.leads.filter(l=>l.stage===s).length);
-  const contacted=db.leads.filter(l=>l.contactedAt).length;
+  const scoped=db.leads.map(l=>leadForAccount(l));
+  const total=scoped.filter(l=>l.stage&&l.stage!==STAGES.JUNK).length;
+  const stats={};Object.values(STAGES).forEach(s=>stats[s]=scoped.filter(l=>l.stage===s).length);
+  const contacted=scoped.filter(l=>l.contactedAt).length;
   res.json({total,contacted,stats,percentages:Object.fromEntries(Object.entries(stats).map(([k,v])=>[k,contacted?Number((v/contacted*100).toFixed(1)):0]))});
 });
-app.get("/api/leads/:id",(req,res)=>{const lead=db.leads.find(l=>l.id===req.params.id);if(!lead)return res.status(404).json({error:"Lead not found"});res.json({data:lead});});
-app.post("/api/leads/upsert",(req,res)=>{const lead=createOrUpdateLead(req.body||{});if(!lead)return res.status(400).json({error:"Phone is required"});res.json({success:true,data:lead});});
+app.get("/api/leads/:id",(req,res)=>{const lead=db.leads.find(l=>l.id===req.params.id);if(!lead)return res.status(404).json({error:"Lead not found"});res.json({data:leadForAccount(lead)});});
+app.post("/api/leads/upsert",(req,res)=>{const lead=createOrUpdateLead(req.body||{});if(!lead)return res.status(400).json({error:"Phone is required"});res.json({success:true,data:leadForAccount(lead)});});
 app.post("/api/leads/:id/stage",(req,res)=>{
   const lead=db.leads.find(l=>l.id===req.params.id);const stage=req.body?.stage;
   if(!lead||!Object.values(STAGES).includes(stage))return res.status(400).json({error:"Invalid lead or stage"});
-  if(stage===STAGES.JUNK)lead.optOut=true;
+  if(stage===STAGES.JUNK)leadAccountState(lead).optOut=true;
   setLeadStage(lead,stage,"manual");
-  res.json({success:true,data:lead});
+  res.json({success:true,data:leadForAccount(lead)});
 });
 app.post("/api/leads/bulk-stage",(req,res)=>{
   const ids=Array.isArray(req.body?.leadIds)?req.body.leadIds:[];const stage=req.body?.stage;
   if(!Object.values(STAGES).includes(stage))return res.status(400).json({error:"Invalid stage"});
-  let changed=0;ids.forEach(id=>{const lead=db.leads.find(l=>l.id===id);if(lead){if(stage===STAGES.JUNK)lead.optOut=true;setLeadStage(lead,stage,"bulk_manual");changed++;}});
+  let changed=0;ids.forEach(id=>{const lead=db.leads.find(l=>l.id===id);if(lead){if(stage===STAGES.JUNK)leadAccountState(lead).optOut=true;setLeadStage(lead,stage,"bulk_manual");changed++;}});
   res.json({success:true,changed});
 });
 app.delete("/api/leads/:id",(req,res)=>{const idx=db.leads.findIndex(l=>l.id===req.params.id);if(idx<0)return res.status(404).json({error:"Lead not found"});db.leads.splice(idx,1);saveDatabase();res.json({success:true});});
-app.post("/api/leads/:id/optout",(req,res)=>{const lead=db.leads.find(l=>l.id===req.params.id);if(!lead)return res.status(404).json({error:"Lead not found"});lead.optOut=true;setLeadStage(lead,STAGES.JUNK,"opt_out");res.json({success:true,data:lead});});
+app.post("/api/leads/:id/optout",(req,res)=>{const lead=db.leads.find(l=>l.id===req.params.id);if(!lead)return res.status(404).json({error:"Lead not found"});leadAccountState(lead).optOut=true;setLeadStage(lead,STAGES.JUNK,"opt_out");res.json({success:true,data:leadForAccount(lead)});});
 
 /* Lead message endpoint */
 app.post("/api/leads/:id/send",(req,res)=>{
   (async()=>{
     try{
       const lead=db.leads.find(l=>l.id===req.params.id);if(!lead)return res.status(404).json({error:"Lead not found"});
-      if(lead.optOut||lead.stage===STAGES.JUNK)return res.status(400).json({error:"Lead is opted out/Junk and cannot be messaged automatically."});
+      if(leadOptedOut(lead)||leadStage(lead)===STAGES.JUNK)return res.status(400).json({error:"Lead is opted out/Junk and cannot be messaged automatically."});
       const {type="template",text,templateName,language,variables=[],mediaUrl,buttonPayloads={},buttonParameters={},action="initial"}=req.body||{};
       if(type==="text"){
         assertMessagingWindow(lead.phone);
@@ -1262,12 +1283,12 @@ async function runCampaign(campaign) {
 function resumeRunningCampaigns() {
   for (const campaign of db.campaigns) {
     if (campaign.status === "running" && Array.isArray(campaign.recipients)) {
-      setTimeout(() => runCampaign(campaign), 1000);
+      setTimeout(() => waAccountContext.run({accountId:campaign.accountId||"primary"},()=>runCampaign(campaign)), 1000);
     }
   }
 }
 
-app.get("/api/campaigns", (req,res)=>res.json({data:db.campaigns}));
+app.get("/api/campaigns", (req,res)=>res.json({data:db.campaigns.filter(c=>(c.accountId||"primary")===activeWhatsAppAccount().id)}));
 app.post("/api/campaigns", (req,res)=>{
   try {
     const {name,leadIds,contactIds,listId,label,labels,templateName,language,variablesByLead={},delayMs=3000,action="followup1",mediaUrl="",buttonPayloads={},buttonParameters={},autoLanguage=false}=req.body||{};
@@ -1283,15 +1304,15 @@ app.post("/api/campaigns", (req,res)=>{
       recipients=db.contacts.filter(c=>{
         const phone=cleanPhone(c?.phone||c?.wa_id||"");
         if(!phone || seen.has(phone)) return false;
-        const match=(c.labels||[]).some(item=>wanted.has(String(item)));
+        const match=contactLabelsForAccount(c).some(item=>wanted.has(String(item)));
         if(match) seen.add(phone);
         return match;
       });
     }
-    else if(label) recipients=db.contacts.filter(c=>(c.labels||[]).includes(label));
+    else if(label) recipients=db.contacts.filter(c=>contactLabelsForAccount(c).includes(label));
     else if(Array.isArray(contactIds)) recipients=contactIds.map(id=>db.contacts.find(c=>c.id===id)).filter(Boolean);
 
-    recipients=recipients.filter(x=>x?.phone && !leadForPhone(x.phone)?.optOut && leadForPhone(x.phone)?.stage!==STAGES.JUNK);
+    recipients=recipients.filter(x=>x?.phone && !leadOptedOut(leadForPhone(x.phone)) && leadStage(leadForPhone(x.phone))!==STAGES.JUNK);
     if(action==="broadcast"){
       recipients=recipients.map(recipient=>{
         const existingLead=leadForPhone(recipient.phone);
@@ -1301,6 +1322,7 @@ app.post("/api/campaigns", (req,res)=>{
     if(!recipients.length)return res.status(400).json({error:"No eligible contacts selected."});
 
     const campaign={
+      accountId: activeWhatsAppAccount().id,
       id:makeId("campaign"),
       name:name||`Campaign ${new Date().toLocaleString()}`,
       templateName,language,action,status:"running",createdAt:now(),updatedAt:now(),
@@ -1311,7 +1333,7 @@ app.post("/api/campaigns", (req,res)=>{
     db.campaigns.unshift(campaign);
     saveDatabase();
     addEvent("campaign_started", { campaignId: campaign.id, total: campaign.total, delayMs: campaign.delayMs });
-    setTimeout(()=>runCampaign(campaign),100);
+    setTimeout(()=>waAccountContext.run({accountId:campaign.accountId||"primary"},()=>runCampaign(campaign)),100);
     res.json({success:true,campaignId:campaign.id,total:campaign.total,delayMs:campaign.delayMs});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
@@ -1329,7 +1351,7 @@ app.post("/api/campaigns/:id/resume",(req,res)=>{
   if(!campaign)return res.status(404).json({error:"Campaign not found"});
   if(campaign.nextIndex >= (campaign.recipients||[]).length)return res.status(400).json({error:"Campaign is already complete."});
   campaign.status="running";campaign.error=null;campaign.updatedAt=now();saveDatabase();
-  setTimeout(()=>runCampaign(campaign),100);
+  setTimeout(()=>waAccountContext.run({accountId:campaign.accountId||"primary"},()=>runCampaign(campaign)),100);
   res.json({success:true,data:campaign});
 });
 
@@ -1387,11 +1409,11 @@ app.get("/api/inbox/:waId/window",(req,res)=>{
   res.json({success:true,data:getMessagingWindow(phone)});
 });
 app.post("/api/inbox/:waId/read",(req,res)=>{const c=db.conversations[conversationKey(req.params.waId)];if(c)c.unread=0;saveDatabase();res.json({success:true});});
-app.post("/api/inbox/:waId/stage",(req,res)=>{const lead=leadForPhone(req.params.waId);if(!lead)return res.status(404).json({error:"Lead not found"});if(req.body?.stage===STAGES.JUNK)lead.optOut=true;setLeadStage(lead,req.body?.stage,"inbox");res.json({success:true,data:lead});});
+app.post("/api/inbox/:waId/stage",(req,res)=>{const lead=leadForPhone(req.params.waId);if(!lead)return res.status(404).json({error:"Lead not found"});if(req.body?.stage===STAGES.JUNK)leadAccountState(lead).optOut=true;setLeadStage(lead,req.body?.stage,"inbox");res.json({success:true,data:leadForAccount(lead)});});
 
 /* Status/search */
 app.get("/api/messages/status",(req,res)=>{
-  let messages=[...db.messages];
+  let messages=db.messages.filter(m=>(m.accountId||"primary")===activeWhatsAppAccount().id);
   if(req.query.phone)messages=messages.filter(m=>cleanPhone(m.wa_id)===cleanPhone(req.query.phone));
   if(req.query.from)messages=messages.filter(m=>new Date(m.timestamp)>=new Date(`${req.query.from}T00:00:00`));
   if(req.query.to)messages=messages.filter(m=>new Date(m.timestamp)<=new Date(`${req.query.to}T23:59:59`));
@@ -1458,10 +1480,10 @@ function handleIncomingMessage(message,value,accountId=activeWhatsAppAccount().i
   else if(text){ const d=detectLanguage(text); if(d.language && contact && (!contact.language || contact.languageSource!=="bitrix")){ contact.language=d.language; contact.languageConfidence=d.confidence; contact.languageSource="conversation"; contact.updatedAt=now(); } }
   const lower=text.toLowerCase();
   if(/^(stop|remove|unsubscribe|not interested|no thanks)\b/.test(lower)||lower.includes("not interested")){
-    if(lead){lead.optOut=true;setLeadStage(lead,STAGES.JUNK,"customer_opt_out");}
+    if(lead){leadAccountState(lead,accountId).optOut=true;setLeadStage(lead,STAGES.JUNK,"customer_opt_out");}
   } else if(media&&["image","video"].includes(message.type)){
     if(lead)setLeadStage(lead,STAGES.PHOTO_RECEIVED,"photo_received");
-  } else if(lead && lead.contactedAt && !lead.optOut && [STAGES.CONTACTED,STAGES.PENDING_FOLLOWUP_1,STAGES.PENDING_FOLLOWUP_2,STAGES.FOLLOWUP_DONE].includes(lead.stage)){
+  } else if(lead && leadAccountState(lead,accountId).contactedAt && !leadAccountState(lead,accountId).optOut && [STAGES.CONTACTED,STAGES.PENDING_FOLLOWUP_1,STAGES.PENDING_FOLLOWUP_2,STAGES.FOLLOWUP_DONE].includes(leadStage(lead,accountId))){
     setLeadStage(lead,STAGES.WAITING_RESPONSE,"customer_replied");
     addEvent("followup_sequence_stopped",{leadId:lead.id,phone:lead.phone,reason:"customer_replied"});
   }
@@ -1592,9 +1614,10 @@ app.post("/api/ai/assist",async(req,res)=>{
 app.get("/api/dashboard/stats",(req,res)=>{
   processLeadTimers();
   const accountId=activeWhatsAppAccount().id,accountMessages=db.messages.filter(m=>(m.accountId||"primary")===accountId),totalContacts=db.contacts.length,totalMessages=accountMessages.length,inbound=accountMessages.filter(m=>m.direction==="inbound").length,outbound=accountMessages.filter(m=>m.direction==="outbound").length,unread=Object.values(db.conversations).filter(c=>(c.accountId||"primary")===accountId).reduce((s,c)=>s+Number(c.unread||0),0);
-  const leadStats={};Object.values(STAGES).forEach(s=>leadStats[s]=db.leads.filter(l=>l.stage===s).length);
-  const contacted=db.leads.filter(l=>l.contactedAt).length;
-  res.json({totalContacts,totalMessages,inbound,outbound,unread,activeCampaigns:db.campaigns.filter(c=>c.status==="running").length,templates:db.templates.length,leadStats,contacted,percentages:Object.fromEntries(Object.entries(leadStats).map(([k,v])=>[k,contacted?Number((v/contacted*100).toFixed(1)):0]))});
+  const scopedLeads=db.leads.map(l=>leadForAccount(l));
+  const leadStats={};Object.values(STAGES).forEach(s=>leadStats[s]=scopedLeads.filter(l=>l.stage===s).length);
+  const contacted=scopedLeads.filter(l=>l.contactedAt).length;
+  res.json({totalContacts,totalMessages,inbound,outbound,unread,activeCampaigns:db.campaigns.filter(c=>(c.accountId||"primary")===accountId&&c.status==="running").length,templates:db.templates.length,leadStats,contacted,percentages:Object.fromEntries(Object.entries(leadStats).map(([k,v])=>[k,contacted?Number((v/contacted*100).toFixed(1)):0]))});
 });
 app.get("/api/events",(req,res)=>res.json({data:db.events.slice(0,200)}));
 app.get("/api/settings/followups",(req,res)=>res.json({data:db.settings}));
@@ -1631,8 +1654,8 @@ async function startServer() {
   db = await loadDatabase();
   ensureDefaultAgent();
   console.log(`[STARTUP] Database loaded: contacts=${db.contacts.length}, leads=${db.leads.length}, messages=${db.messages.length}`);
-  void processLeadTimers();
-  setInterval(() => { void processLeadTimers(); }, 30000);
+  for (const accountId of Object.keys(WA_ACCOUNTS)) void waAccountContext.run({accountId},()=>processLeadTimers());
+  setInterval(() => { for (const accountId of Object.keys(WA_ACCOUNTS)) void waAccountContext.run({accountId},()=>processLeadTimers()); }, 30000);
   appReady = true;
   app.listen(PORT,"0.0.0.0",()=>{
     console.log(`Royal Hair WhatsApp Dashboard running on port ${PORT}`);
