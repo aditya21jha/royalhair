@@ -937,16 +937,50 @@ function extractBitrixPhone(b) {
 }
 async function updateBitrixWaitingResponse(leadId) {
   if (!BITRIX_WEBHOOK_URL) throw new Error("BITRIX_WEBHOOK_URL is not configured");
-  const r = await fetch(`${BITRIX_WEBHOOK_URL}crm.item.update.json`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({entityTypeId:1,id:Number(leadId),fields:{stageId:"STATUS:16"}}) });
+  // Bitrix classic CRM Leads use crm.lead.update + STATUS_ID, not crm.item.update + stageId.
+  const r = await fetch(`${BITRIX_WEBHOOK_URL}crm.lead.update.json`, {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({id:Number(leadId),fields:{STATUS_ID:"16"}})
+  });
   const data = await r.json();
-  if (!r.ok || data.error) throw new Error(data.error_description || data.error || "WhatsApp accepted, but Bitrix stage update failed");
+  if (!r.ok || data.error || data.result !== true) throw new Error(data.error_description || data.error || "WhatsApp accepted, but Bitrix stage update failed");
   return data;
+}
+async function syncAcceptedInitialLead(id, queueItem) {
+  // Reconcile a message already accepted by Meta without ever sending it again.
+  const leadItem = await getBitrixLead(id);
+  if (!leadItem) throw new Error("Meta accepted the message, but Bitrix lead could not be retrieved for stage sync.");
+  const latestStage = String(leadItem.statusId || leadItem.STATUS_ID || leadItem.stageId || "");
+  let stageUpdated = false;
+  if (!latestStage || ["NEW","STATUS:NEW"].includes(latestStage)) {
+    await updateBitrixWaitingResponse(id);
+    stageUpdated = true;
+  }
+  const phone = extractBitrixPhone(leadItem) || queueItem.phone;
+  const accountId = queueItem.accountId || db.settings.autoInitialAccountId || "primary";
+  const localLead = createOrUpdateLead({bitrixId:Number(id),phone,name:leadItem.title||queueItem.name||`Lead #${id}`,language:queueItem.language||bitrixLanguageLabel(leadItem.ufCrm_1690811363903||""),source:"Bitrix",createdAt:leadItem.dateCreate||now()});
+  if (localLead) {
+    await waAccountContext.run({accountId}, async()=>{
+      const state = leadAccountState(localLead, accountId);
+      if (!state.contactedAt) markContacted(localLead,{messageId:queueItem.messageId||null,templateName:queueItem.templateName||null,sentAt:queueItem.acceptedAt||now()},true);
+      else { state.contactedAt = state.contactedAt || queueItem.acceptedAt || now(); saveDatabase(); }
+    });
+  }
+  updateInitialQueue(id,{status:stageUpdated || !["NEW","STATUS:NEW",""].includes(latestStage) ? "sent" : "accepted",stageUpdated,reason:stageUpdated ? "Meta accepted the message; Bitrix moved to Waiting for Response (STATUS_ID 16), and the app lead was moved to Contacted." : `Meta accepted the message. App lead was synchronized; Bitrix stage ${latestStage||"unknown"} was preserved.`,localStageUpdated:Boolean(localLead)});
+  return initialQueueRecord(id);
 }
 const autoInitialWorkers = new Set();
 async function processAutomaticInitialCore(bitrixId) {
   const id = String(bitrixId || "").trim(); if (!id) return;
   const existing = initialQueueRecord(id);
-  if (existing && ["sent","accepted","delivered","review_required","skipped","failed"].includes(existing.status)) return existing;
+  if (existing && ["accepted"].includes(existing.status) && existing.messageId) {
+    try { return await syncAcceptedInitialLead(id, existing); }
+    catch (error) {
+      updateInitialQueue(id,{status:"accepted",stageUpdated:false,reason:`Meta already accepted the message; stage sync needs attention: ${error.message}`,error:error.message});
+      return initialQueueRecord(id);
+    }
+  }
+  if (existing && ["sent","delivered","review_required","skipped","failed"].includes(existing.status)) return existing;
   if (!db.settings.autoInitialEnabled) return updateInitialQueue(id,{status:"skipped",reason:"Automatic initial messaging is disabled."});
   const accountId = db.settings.autoInitialAccountId === "secondary" ? "secondary" : "primary";
   const leadItem = await getBitrixLead(id);
@@ -971,20 +1005,11 @@ async function processAutomaticInitialCore(bitrixId) {
       return sendTemplateMessage({to:phone,name:template.name,language:template.language,components,leadId:null,action:"auto_initial"});
     });
     const messageId = result?.messages?.[0]?.id || null;
-    updateInitialQueue(id,{status:"accepted",messageId,acceptedAt:now(),reason:"Meta accepted the message; updating Bitrix stage."});
-    // Never overwrite a stage changed manually while the message was in flight.
-    const latest = await getBitrixLead(id);
-    const latestStage = String(latest?.stageId || "");
-    if (!latest || (latestStage && !["NEW","STATUS:NEW"].includes(latestStage))) {
-      updateInitialQueue(id,{status:"accepted",reason:`Meta accepted the message. Bitrix stage was not changed because the lead is now at ${latestStage || "an unknown stage"}.`});
-      return initialQueueRecord(id);
-    }
-    await updateBitrixWaitingResponse(id);
-    updateInitialQueue(id,{status:"sent",reason:"Meta accepted the message and Bitrix was moved to Waiting for Response (STATUS_ID 16).",stageUpdated:true});
-    const localLead = createOrUpdateLead({bitrixId:Number(id),phone,name:leadItem.title||`Lead #${id}`,language:languageLabel,source:"Bitrix",createdAt:leadItem.dateCreate||now()});
-    if (localLead) { const accountState=leadAccountState(localLead,accountId); accountState.contactedAt=now(); if(accountId==="primary")localLead.contactedAt=accountState.contactedAt; saveDatabase(); }
-    addEvent("auto_initial_sent",{bitrixId:id,accountId,templateName:template.name,language:languageLabel,messageId,stageUpdated:true});
-    return initialQueueRecord(id);
+    updateInitialQueue(id,{status:"accepted",messageId,acceptedAt:now(),reason:"Meta accepted the message; synchronizing app and Bitrix stages."});
+    // Reconcile app funnel and Bitrix stage after Meta acceptance. Existing accepted messages are never resent.
+    const synced = await syncAcceptedInitialLead(id, initialQueueRecord(id));
+    addEvent("auto_initial_sent",{bitrixId:id,accountId,templateName:template.name,language:languageLabel,messageId,stageUpdated:Boolean(synced?.stageUpdated)});
+    return synced;
   } catch (error) {
     const currentQueue=initialQueueRecord(id);
     if(currentQueue?.messageId && ["accepted","sent","delivered","read"].includes(currentQueue.status)) {
@@ -1018,6 +1043,13 @@ async function pollBitrixForNewLeads() {
   if (bitrixPollRunning || !db || !BITRIX_WEBHOOK_URL || !db.settings.autoInitialEnabled) return;
   bitrixPollRunning = true;
   try {
+    // Repair stage synchronization for messages Meta already accepted in earlier runs.
+    // This path never resends messages; it only syncs the app funnel and Bitrix status.
+    const acceptedNeedingSync = (db.settings.autoInitialQueue || []).filter(q => q.type === "initial" && q.status === "accepted" && q.messageId).slice(0, 20);
+    for (const item of acceptedNeedingSync) {
+      try { await processAutomaticInitial(item.bitrixId); }
+      catch (syncError) { console.error(`[BITRIX STAGE SYNC] Lead ${item.bitrixId}: ${syncError.message}`); }
+    }
     const cursor = Number(db.settings.autoInitialLastSeenLeadId || 0);
     // First run establishes a baseline so historical CRM leads are not messaged unexpectedly.
     if (!db.settings.autoInitialPollingInitialized) {
