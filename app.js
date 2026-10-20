@@ -9,10 +9,17 @@ const {
 } = require("libphonenumber-js");
 
 const crypto = require("crypto");
+const { AsyncLocalStorage } = require("async_hooks");
+const waAccountContext = new AsyncLocalStorage();
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "15mb" }));
 app.use(express.urlencoded({ extended: true }));
+app.use((req,res,next) => {
+  const requested = String(req.headers["x-whatsapp-account"] || req.query.accountId || req.body?.accountId || "primary");
+  const accountId = requested === "secondary" ? "secondary" : "primary";
+  waAccountContext.run({ accountId }, next);
+});
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
@@ -93,6 +100,17 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const WABA_ID = process.env.WABA_ID;
+const SECOND_PHONE_NUMBER_ID = process.env.SECOND_PHONE_NUMBER_ID || "1277018182169272";
+const SECOND_WABA_ID = process.env.SECOND_WABA_ID || "1361076229487113";
+const SECOND_WHATSAPP_NUMBER = process.env.SECOND_WHATSAPP_NUMBER || "+90 507 859 66 88";
+const PRIMARY_WHATSAPP_NUMBER = process.env.CONNECTED_WHATSAPP_NUMBER || "+90 501 671 57 88";
+const WA_ACCOUNTS = {
+  primary: { id: "primary", label: "Royal Hair · 5788", number: PRIMARY_WHATSAPP_NUMBER, phoneNumberId: PHONE_NUMBER_ID, wabaId: WABA_ID },
+  secondary: { id: "secondary", label: "Royal Hair · 6688", number: SECOND_WHATSAPP_NUMBER, phoneNumberId: SECOND_PHONE_NUMBER_ID, wabaId: SECOND_WABA_ID }
+};
+function activeWhatsAppAccount() { return WA_ACCOUNTS[waAccountContext.getStore()?.accountId] || WA_ACCOUNTS.primary; }
+function accountForPhoneNumberId(id) { return Object.values(WA_ACCOUNTS).find(a => a.phoneNumberId && String(a.phoneNumberId) === String(id)) || WA_ACCOUNTS.primary; }
+function conversationKey(phone, accountId = activeWhatsAppAccount().id) { return `${accountId}:${cleanPhone(phone)}`; }
 const BITRIX_WEBHOOK_URL = process.env.BITRIX_WEBHOOK_URL;
 const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v23.0";
 const GRAPH_URL = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
@@ -309,24 +327,21 @@ function upsertContact(data) {
   saveDatabase();
   return contact;
 }
-function getConversation(phone) {
+function getConversation(phone, accountId = activeWhatsAppAccount().id) {
   const normalized = cleanPhone(phone);
-  if (!db.conversations[normalized]) {
-    db.conversations[normalized] = {
-      wa_id: normalized,
-      unread: 0,
-      lastIncomingAt: null,
-      lastIncomingId: null,
-      lastMessageAt: null,
-      lastMessage: "",
-      lastDirection: null
+  const key = conversationKey(normalized, accountId);
+  if (!db.conversations[key]) {
+    db.conversations[key] = {
+      wa_id: normalized, accountId,
+      unread: 0, lastIncomingAt: null, lastIncomingId: null,
+      lastMessageAt: null, lastMessage: "", lastDirection: null
     };
   }
-  return db.conversations[normalized];
+  return db.conversations[key];
 }
 function getMessagingWindow(phone) {
   const normalized = cleanPhone(phone);
-  const conversation = db.conversations[normalized];
+  const conversation = db.conversations[conversationKey(normalized)];
   const lastIncomingAt = conversation?.lastIncomingAt ? new Date(conversation.lastIncomingAt) : null;
   const valid = !!lastIncomingAt && !Number.isNaN(lastIncomingAt.getTime());
   const windowExpiresAt = valid ? new Date(lastIncomingAt.getTime() + 24 * 60 * 60 * 1000) : null;
@@ -601,9 +616,11 @@ function renderTemplateText(templateName, language, components = []) {
 function storeOutboundMessage({ to, messageId, type, text = "", templateName = null, templateLanguage = null, templateComponents = [], metaResponse = null, leadId = null, action = null, agentId = null }) {
   const phone = cleanPhone(to);
   upsertContact({ phone, wa_id: phone });
-  const conversation = getConversation(phone);
+  const accountId = activeWhatsAppAccount().id;
+  const conversation = getConversation(phone, accountId);
   const message = {
     id: makeId("msg"),
+    accountId,
     wamid: messageId,
     wa_id: phone,
     direction: "outbound",
@@ -638,13 +655,13 @@ async function sendTextMessage(to, body, meta = {}) {
     type: "text",
     text: { preview_url: false, body: String(body) }
   };
-  const result = await metaRequest(`/${PHONE_NUMBER_ID}/messages`, { method: "POST", body: JSON.stringify(payload) });
+  const result = await metaRequest(`/${activeWhatsAppAccount().phoneNumberId}/messages`, { method: "POST", body: JSON.stringify(payload) });
   const messageId = result?.messages?.[0]?.id || null;
   storeOutboundMessage({ to: recipient, messageId, type: "text", text: body, metaResponse: result, leadId: meta.leadId, action: meta.action, agentId: meta.agentId });
   return result;
 }
 function getTemplateConfigKey(template) {
-  return `${template?.name || ""}::${template?.language || ""}`;
+  return `${activeWhatsAppAccount().id}::${template?.name || ""}::${template?.language || ""}`;
 }
 function templateByKey(name, language) {
   return db.templates.find(t => t.name === name && t.language === language);
@@ -768,7 +785,7 @@ async function sendTemplateMessage({ to, name, language, components = [], leadId
     type: "template",
     template: { name, language: { code: language }, ...(components.length ? { components } : {}) }
   };
-  const result = await metaRequest(`/${PHONE_NUMBER_ID}/messages`, { method: "POST", body: JSON.stringify(payload) });
+  const result = await metaRequest(`/${activeWhatsAppAccount().phoneNumberId}/messages`, { method: "POST", body: JSON.stringify(payload) });
   const messageId = result?.messages?.[0]?.id || null;
   storeOutboundMessage({
     to: recipient,
@@ -807,23 +824,23 @@ async function sendLeadMessage({ lead, template, variables = [], mediaUrl = "", 
 }
 
 /* Health/config */
-app.get("/api/health", (req,res) => res.json({ ok:true, service:"Royal Hair Istanbul WhatsApp Dashboard", timestamp:now(), whatsappConfigured:Boolean(WHATSAPP_TOKEN&&PHONE_NUMBER_ID&&WABA_ID), bitrixConfigured:Boolean(BITRIX_WEBHOOK_URL) }));
+app.get("/api/health", (req,res) => res.json({ ok:true, service:"Royal Hair Istanbul WhatsApp Dashboard", timestamp:now(), whatsappConfigured:Boolean(WHATSAPP_TOKEN&&activeWhatsAppAccount().phoneNumberId&&activeWhatsAppAccount().wabaId), bitrixConfigured:Boolean(BITRIX_WEBHOOK_URL) }));
 app.get("/api/config", async (req,res) => {
   const base = {
-    configured:Boolean(WHATSAPP_TOKEN&&PHONE_NUMBER_ID&&WABA_ID),
-    phoneNumberId:PHONE_NUMBER_ID||"",
-    wabaId:WABA_ID||"",
+    configured:Boolean(WHATSAPP_TOKEN&&activeWhatsAppAccount().phoneNumberId&&activeWhatsAppAccount().wabaId),
+    phoneNumberId:activeWhatsAppAccount().phoneNumberId||"",
+    wabaId:activeWhatsAppAccount().wabaId||"",
     graphApiVersion:GRAPH_API_VERSION,
-    connectedNumber:process.env.CONNECTED_WHATSAPP_NUMBER || "",
+    connectedNumber:activeWhatsAppAccount().number || "",
     whatsappStatus:"unknown",
     displayPhoneNumber:"",
     verifiedName:"",
     qualityRating:"",
     platformType:""
   };
-  if(!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) return res.json(base);
+  if(!WHATSAPP_TOKEN || !activeWhatsAppAccount().phoneNumberId) return res.json(base);
   try {
-    const phone = await metaRequest(`/${PHONE_NUMBER_ID}?fields=id,display_phone_number,verified_name,quality_rating,status,platform_type,is_on_biz_app,code_verification_status,is_pin_enabled`);
+    const phone = await metaRequest(`/${activeWhatsAppAccount().phoneNumberId}?fields=id,display_phone_number,verified_name,quality_rating,status,platform_type,is_on_biz_app,code_verification_status,is_pin_enabled`);
     base.whatsappStatus = String(phone?.status || "unknown").toUpperCase();
     base.displayPhoneNumber = phone?.display_phone_number || "";
     base.verifiedName = phone?.verified_name || "";
@@ -840,17 +857,17 @@ app.get("/api/config", async (req,res) => {
 });
 
 app.get("/api/diagnostics/whatsapp", async (req,res) => {
-  const result = { timestamp: now(), config: { token: !!WHATSAPP_TOKEN, phoneNumberId: !!PHONE_NUMBER_ID, wabaId: !!WABA_ID, graphApiVersion: GRAPH_API_VERSION }, checks: {} };
+  const result = { timestamp: now(), config: { token: !!WHATSAPP_TOKEN, phoneNumberId: !!activeWhatsAppAccount().phoneNumberId, wabaId: !!activeWhatsAppAccount().wabaId, graphApiVersion: GRAPH_API_VERSION }, checks: {} };
   try {
     const me = await metaRequest(`/me`);
     result.checks.token = { ok: true, id: me?.id || null, name: me?.name || null };
   } catch (e) { result.checks.token = { ok: false, error: e.message, meta: e.meta || null }; }
   try {
-    const phone = await metaRequest(`/${PHONE_NUMBER_ID}?fields=id,display_phone_number,verified_name,quality_rating,status`);
+    const phone = await metaRequest(`/${activeWhatsAppAccount().phoneNumberId}?fields=id,display_phone_number,verified_name,quality_rating,status`);
     result.checks.phoneNumber = { ok: true, data: phone };
   } catch (e) { result.checks.phoneNumber = { ok: false, error: e.message, meta: e.meta || null }; }
   try {
-    const subs = await metaRequest(`/${WABA_ID}/subscribed_apps`);
+    const subs = await metaRequest(`/${activeWhatsAppAccount().wabaId}/subscribed_apps`);
     result.checks.wabaSubscription = { ok: true, data: subs };
   } catch (e) { result.checks.wabaSubscription = { ok: false, error: e.message, meta: e.meta || null }; }
   result.checks.localWebhook = { ok: true, callback: `${req.protocol}://${req.get("host")}/webhook`, note: "Real WhatsApp events must appear in Render logs as POST /webhook." };
@@ -940,8 +957,8 @@ app.post("/api/bitrix/send-template", async (req,res)=>{
 
 /* Templates */
 async function fetchAllTemplates(){
-  if(!WABA_ID) throw new Error("WABA_ID is not configured.");
-  let url=`/${WABA_ID}/message_templates?fields=id,name,status,category,language,components,quality_score&limit=100`;
+  if(!activeWhatsAppAccount().wabaId) throw new Error("WABA_ID is not configured for the selected number.");
+  let url=`/${activeWhatsAppAccount().wabaId}/message_templates?fields=id,name,status,category,language,components,quality_score&limit=100`;
   const all=[]; let pages=0;
   while(url&&pages<20){const data=await metaRequest(url); if(Array.isArray(data.data)) all.push(...data.data); url=data?.paging?.next?data.paging.next.replace(GRAPH_URL,""):null; pages++;}
   db.templates=all; saveDatabase(); addEvent("templates_synced",{count:all.length}); return all;
@@ -1318,13 +1335,14 @@ app.post("/api/campaigns/:id/resume",(req,res)=>{
 
 /* Inbox */
 app.get("/api/inbox",(req,res)=>{
-  const conversations=Object.values(db.conversations).map(c=>({...c,contact:getContact(c.wa_id),lead:leadForPhone(c.wa_id)})).sort((a,b)=>new Date(b.lastMessageAt||0)-new Date(a.lastMessageAt||0));
+  const accountId=activeWhatsAppAccount().id;
+  const conversations=Object.values(db.conversations).filter(c=>(c.accountId||"primary")===accountId).map(c=>({...c,contact:getContact(c.wa_id),lead:leadForPhone(c.wa_id)})).sort((a,b)=>new Date(b.lastMessageAt||0)-new Date(a.lastMessageAt||0));
   res.json({data:conversations});
 });
-app.get("/api/inbox/:waId/messages",(req,res)=>res.json({data:db.messages.filter(m=>cleanPhone(m.wa_id)===cleanPhone(req.params.waId))}));
+app.get("/api/inbox/:waId/messages",(req,res)=>res.json({data:db.messages.filter(m=>cleanPhone(m.wa_id)===cleanPhone(req.params.waId)&&(m.accountId||"primary")===activeWhatsAppAccount().id)}));
 
 async function uploadWhatsAppMedia(dataUrl, mimeType, filename){
-  if(!WHATSAPP_TOKEN||!PHONE_NUMBER_ID) throw new Error("WhatsApp credentials are not configured.");
+  if(!WHATSAPP_TOKEN||!activeWhatsAppAccount().phoneNumberId) throw new Error("WhatsApp credentials are not configured for the selected number.");
   const match=String(dataUrl||"").match(/^data:([^;]+);base64,(.+)$/);
   if(!match) throw new Error("Invalid media data.");
   const buffer=Buffer.from(match[2],"base64");
@@ -1332,7 +1350,7 @@ async function uploadWhatsAppMedia(dataUrl, mimeType, filename){
   const form=new FormData();
   form.append("messaging_product","whatsapp");
   form.append("file",blob,filename||"upload");
-  const r=await fetch(`${GRAPH_URL}/${PHONE_NUMBER_ID}/media`,{method:"POST",headers:{Authorization:`Bearer ${WHATSAPP_TOKEN}`},body:form});
+  const r=await fetch(`${GRAPH_URL}/${activeWhatsAppAccount().phoneNumberId}/media`,{method:"POST",headers:{Authorization:`Bearer ${WHATSAPP_TOKEN}`},body:form});
   const data=await r.json();
   if(!r.ok||data.error){const e=new Error(data?.error?.message||"Media upload failed");e.status=r.status;e.meta=data;throw e}
   return data.id;
@@ -1345,7 +1363,7 @@ app.post("/api/inbox/:waId/send-media",async(req,res)=>{
     const mediaId=await uploadWhatsAppMedia(dataUrl,mimeType,filename);
     const type=String(mimeType||"").startsWith("image/")?"image":String(mimeType||"").startsWith("video/")?"video":String(mimeType||"").startsWith("audio/")?"audio":"document";
     const payload={messaging_product:"whatsapp",recipient_type:"individual",to:phone,type,[type]:{id:mediaId,...(caption?{caption}:{}),...(type==="document"&&filename?{filename}: {})}};
-    const result=await metaRequest(`/${PHONE_NUMBER_ID}/messages`,{method:"POST",body:JSON.stringify(payload)});
+    const result=await metaRequest(`/${activeWhatsAppAccount().phoneNumberId}/messages`,{method:"POST",body:JSON.stringify(payload)});
     const messageId=result?.messages?.[0]?.id||null;
     storeOutboundMessage({to:phone,messageId,type, text:caption,metaResponse:result,leadId:leadForPhone(phone)?.id||null,action:"inbox_media",agentId:currentAgent(req)?.id||null});
     res.json({success:true,result,mediaId});
@@ -1368,7 +1386,7 @@ app.get("/api/inbox/:waId/window",(req,res)=>{
   const phone=cleanPhone(req.params.waId);
   res.json({success:true,data:getMessagingWindow(phone)});
 });
-app.post("/api/inbox/:waId/read",(req,res)=>{const c=db.conversations[cleanPhone(req.params.waId)];if(c)c.unread=0;saveDatabase();res.json({success:true});});
+app.post("/api/inbox/:waId/read",(req,res)=>{const c=db.conversations[conversationKey(req.params.waId)];if(c)c.unread=0;saveDatabase();res.json({success:true});});
 app.post("/api/inbox/:waId/stage",(req,res)=>{const lead=leadForPhone(req.params.waId);if(!lead)return res.status(404).json({error:"Lead not found"});if(req.body?.stage===STAGES.JUNK)lead.optOut=true;setLeadStage(lead,req.body?.stage,"inbox");res.json({success:true,data:lead});});
 
 /* Status/search */
@@ -1408,20 +1426,22 @@ app.post("/webhook",(req,res)=>{
     (body.entry||[]).forEach(entry=>(entry.changes||[]).forEach(change=>{
       const value=change.value||{};
       console.log(`[WEBHOOK CHANGE] field=${change.field||""} messages=${(value.messages||[]).length} statuses=${(value.statuses||[]).length}`);
-      (value.messages||[]).forEach(m=>{ console.log(`[WEBHOOK INCOMING] from=${String(m.from||"").slice(-4)} type=${m.type} id=${m.id}`); handleIncomingMessage(m,value); });
+      const account = accountForPhoneNumberId(value?.metadata?.phone_number_id);
+      (value.messages||[]).forEach(m=>{ console.log(`[WEBHOOK INCOMING] account=${account.id} from=${String(m.from||"").slice(-4)} type=${m.type} id=${m.id}`); waAccountContext.run({accountId:account.id},()=>handleIncomingMessage(m,value,account.id)); });
       (value.statuses||[]).forEach(s=>{
-        console.log(`[WEBHOOK STATUS] wamid=${s.id} status=${s.status} recipient=${String(s.recipient_id||"").slice(-4)}`);
+        waAccountContext.run({accountId:account.id},()=>{ console.log(`[WEBHOOK STATUS] account=${account.id} wamid=${s.id} status=${s.status} recipient=${String(s.recipient_id||"").slice(-4)}`);
         if(Array.isArray(s.errors) && s.errors.length) console.error(`[WEBHOOK ERROR] wamid=${s.id} ${JSON.stringify(s.errors)}`);
         handleStatusUpdate(s);
+        });
       });
     }));
   }catch(e){console.error("Webhook processing error:",e);}
 });
-function handleIncomingMessage(message,value){
+function handleIncomingMessage(message,value,accountId=activeWhatsAppAccount().id){
   const phone=cleanPhone(message.from);if(!phone)return;
   const profileName=value?.contacts?.find(c=>cleanPhone(c.wa_id)===phone)?.profile?.name;
   const contact=upsertContact({phone,wa_id:phone,name:profileName||"WhatsApp Contact"});
-  const conversation=getConversation(phone);
+  const conversation=getConversation(phone,accountId);
   let text="";let media=null;
   if(message.type==="text")text=message.text?.body||"";
   else if(message.type==="button")text=message.button?.text||"";
@@ -1431,7 +1451,7 @@ function handleIncomingMessage(message,value){
     text=media.caption||`[${message.type}]`;
   } else text=`[${message.type||"message"}]`;
   const timestamp=message.timestamp?new Date(Number(message.timestamp)*1000).toISOString():now();
-  db.messages.push({id:makeId("msg"),wamid:message.id,wa_id:phone,direction:"inbound",type:message.type||"unknown",text,media,raw:message,status:"received",timestamp});
+  db.messages.push({id:makeId("msg"),accountId,wamid:message.id,wa_id:phone,direction:"inbound",type:message.type||"unknown",text,media,raw:message,status:"received",timestamp});
   conversation.unread=Number(conversation.unread||0)+1;conversation.lastIncomingAt=timestamp;conversation.lastIncomingId=message.id||makeId("in");conversation.lastMessageAt=timestamp;conversation.lastMessage=text;conversation.lastDirection="inbound";
   const lead=leadForPhone(phone);
   if(lead && text) enrichLanguage(lead,text);
@@ -1571,7 +1591,7 @@ app.post("/api/ai/assist",async(req,res)=>{
 /* Dashboard */
 app.get("/api/dashboard/stats",(req,res)=>{
   processLeadTimers();
-  const totalContacts=db.contacts.length,totalMessages=db.messages.length,inbound=db.messages.filter(m=>m.direction==="inbound").length,outbound=db.messages.filter(m=>m.direction==="outbound").length,unread=Object.values(db.conversations).reduce((s,c)=>s+Number(c.unread||0),0);
+  const accountId=activeWhatsAppAccount().id,accountMessages=db.messages.filter(m=>(m.accountId||"primary")===accountId),totalContacts=db.contacts.length,totalMessages=accountMessages.length,inbound=accountMessages.filter(m=>m.direction==="inbound").length,outbound=accountMessages.filter(m=>m.direction==="outbound").length,unread=Object.values(db.conversations).filter(c=>(c.accountId||"primary")===accountId).reduce((s,c)=>s+Number(c.unread||0),0);
   const leadStats={};Object.values(STAGES).forEach(s=>leadStats[s]=db.leads.filter(l=>l.stage===s).length);
   const contacted=db.leads.filter(l=>l.contactedAt).length;
   res.json({totalContacts,totalMessages,inbound,outbound,unread,activeCampaigns:db.campaigns.filter(c=>c.status==="running").length,templates:db.templates.length,leadStats,contacted,percentages:Object.fromEntries(Object.entries(leadStats).map(([k,v])=>[k,contacted?Number((v/contacted*100).toFixed(1)):0]))});
@@ -1600,7 +1620,8 @@ app.post("/api/settings/followups",(req,res)=>{
 });
 
 /* Connected numbers UI */
-app.get("/api/numbers",(req,res)=>res.json({data:db.connectedNumbers,active:process.env.CONNECTED_WHATSAPP_NUMBER||""}));
+app.get("/api/numbers",(req,res)=>{const data=Object.values(WA_ACCOUNTS).map(a=>({id:a.id,number:a.number,label:a.label,phoneNumberId:a.phoneNumberId,wabaId:a.wabaId}));res.json({active:activeWhatsAppAccount().number,data});});
+app.get("/api/whatsapp-accounts",(req,res)=>res.json({data:Object.values(WA_ACCOUNTS).map(a=>({id:a.id,number:a.number,label:a.label,active:a.id===activeWhatsAppAccount().id,configured:Boolean(WHATSAPP_TOKEN&&a.phoneNumberId&&a.wabaId)}))}));
 app.post("/api/numbers",(req,res)=>{const {number,label}=req.body||{};if(!number)return res.status(400).json({error:"Number is required"});const item={id:makeId("number"),number:String(number),label:String(label||"WhatsApp Number"),createdAt:now()};db.connectedNumbers.push(item);saveDatabase();res.json({success:true,data:item});});
 
 /* Root */
