@@ -1324,6 +1324,12 @@ app.post("/api/leads/bulk-stage",(req,res)=>{
   let changed=0;ids.forEach(id=>{const lead=db.leads.find(l=>l.id===id);if(lead){if(stage===STAGES.JUNK)leadAccountState(lead).optOut=true;setLeadStage(lead,stage,"bulk_manual");changed++;}});
   res.json({success:true,changed});
 });
+app.post("/api/leads/bulk-delete",(req,res)=>{
+  const ids=Array.isArray(req.body?.leadIds)?[...new Set(req.body.leadIds.map(String))]:[];
+  if(!ids.length)return res.status(400).json({error:"Select at least one lead."});
+  const before=db.leads.length;const wanted=new Set(ids);db.leads=db.leads.filter(l=>!wanted.has(String(l.id)));const removed=before-db.leads.length;
+  saveDatabase();res.json({success:true,removed,requested:ids.length,notFound:ids.length-removed});
+});
 app.delete("/api/leads/:id",(req,res)=>{const idx=db.leads.findIndex(l=>l.id===req.params.id);if(idx<0)return res.status(404).json({error:"Lead not found"});db.leads.splice(idx,1);saveDatabase();res.json({success:true});});
 app.post("/api/leads/:id/optout",(req,res)=>{const lead=db.leads.find(l=>l.id===req.params.id);if(!lead)return res.status(404).json({error:"Lead not found"});leadAccountState(lead).optOut=true;setLeadStage(lead,STAGES.JUNK,"opt_out");res.json({success:true,data:leadForAccount(lead)});});
 
