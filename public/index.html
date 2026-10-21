@@ -753,9 +753,10 @@ async function deleteInboxMessage(id){const m=findInboxMessage(id);if(!m)return;
 function forwardInboxMessage(id){const m=findInboxMessage(id);if(!m)return;const text=String(m.text||m.media?.caption||'');const choices=conversations.filter(c=>String(c.wa_id)!==String(selectedConversation));openModal('Forward message',`<p class="hint">Choose a conversation. The message text will be copied into that chat’s composer so you can review and send it. Media forwarding is not available as a native Cloud API action.</p><div class="rh-forward-modal-list">${choices.map(c=>`<button class="rh-forward-option" onclick="prepareForward('${esc(c.wa_id)}','${esc(id)}')"><span class="rh-avatar-orb">${esc((c.contact?.name||c.wa_id||'?').slice(0,1).toUpperCase())}</span><span><b>${esc(c.contact?.name||c.wa_id)}</b><small style="display:block;color:#78909b">${esc(c.wa_id)}</small></span></button>`).join('')||'<div class="empty">No other conversations available.</div>'}</div><div class="actions"><button class="btn btn-light" onclick="closeModal()">Cancel</button></div>`)}
 async function prepareForward(phone,id){const m=findInboxMessage(id);if(!m)return;closeModal();await openConversation(phone);const composer=document.getElementById('chatText');if(composer){composer.value=String(m.text||m.media?.caption||'');composer.focus();toast('Message copied to the selected chat. Review and press Send.')}}
 
-function dismissIncomingNotif(){document.getElementById("incomingNotif")?.classList.remove("show");clearTimeout(window._incomingNotifTimer)}
+function incomingNotifKey(c){return `${String(c.wa_id||"")}|${String(c.lastIncomingId||c.lastIncomingAt||"")}|${String(c.lastMessage||"")}`}
+function dismissIncomingNotif(){const el=document.getElementById("incomingNotif");if(el){el.classList.remove("show");if(window._incomingNotifCurrentKey){window._dismissedIncomingNotifs=window._dismissedIncomingNotifs||{};window._dismissedIncomingNotifs[window._incomingNotifCurrentKey]=Date.now()}}clearTimeout(window._incomingNotifTimer)}
 function dismissNewLeadNotif(){document.getElementById("newLeadNotif")?.classList.remove("show");clearTimeout(window._notif)}
-function showIncomingNotif(c){const el=document.getElementById("incomingNotif");if(!el)return;document.getElementById("incomingNotifText").textContent=`${c.contact?.name||c.wa_id}: ${c.lastMessage||"New message"}`;el.classList.add("show");window._incomingPhone=c.wa_id;clearTimeout(window._incomingNotifTimer);window._incomingNotifTimer=setTimeout(dismissIncomingNotif,12000)}
+function showIncomingNotif(c){const el=document.getElementById("incomingNotif");if(!el)return;const key=incomingNotifKey(c);window._dismissedIncomingNotifs=window._dismissedIncomingNotifs||{};if(window._dismissedIncomingNotifs[key])return;if(window._incomingNotifCurrentKey===key&&el.classList.contains("show"))return;document.getElementById("incomingNotifText").textContent=`${c.contact?.name||c.wa_id}: ${c.lastMessage||"New message"}`;window._incomingNotifCurrentKey=key;el.classList.add("show");window._incomingPhone=c.wa_id;clearTimeout(window._incomingNotifTimer);window._incomingNotifTimer=setTimeout(dismissIncomingNotif,9000)}
 function openIncomingConversation(){if(window._incomingPhone){openConversation(window._incomingPhone);dismissIncomingNotif()}}
 function renderConversations(){
   const q=(document.getElementById("inboxSearch")?.value||"").toLowerCase(),stage=document.getElementById("inboxStageFilter")?.value||"";
@@ -984,4 +985,46 @@ initialize();
 #chatText,#chatText:focus,#chatText::placeholder{color:#172b3b!important}
 #chatText{background:#fff!important;border:1px solid #cbd5e1!important;caret-color:#172b3b!important}
 .number-account-option:hover{background:#edf6ff!important}
+</style>
+
+<style id="rh-shared-inbox-redesign-v2">
+/* Shared Inbox clean, Instagram-inspired workspace */
+#section-inbox .inbox{grid-template-columns:minmax(300px,350px) minmax(0,1fr);height:calc(100vh - 178px);min-height:560px;border:1px solid #dce5ec;border-radius:20px;background:#fff;box-shadow:0 12px 38px rgba(22,48,69,.08)}
+#section-inbox .inbox-list{background:#fff;border-right:1px solid #e5ebf0}
+#section-inbox .inbox-filter{padding:16px;background:#fff;border-bottom:1px solid #edf1f4}
+#section-inbox .inbox-filter input,#section-inbox .inbox-filter select{border-radius:13px;background:#f4f6f8;border:1px solid #e5eaf0;color:#172b3a;font-size:13px;min-height:44px}
+#section-inbox .conversation{padding:14px 15px;border-bottom:1px solid #f0f2f5;border-radius:0;transition:background .15s}
+#section-inbox .conversation:hover{background:#f7f9fb;transform:none}
+#section-inbox .conversation.active{background:#eaf5ff;box-shadow:inset 3px 0 #1685d1}
+#section-inbox .conversation-name{font-size:14px;color:#142b3b;font-weight:750;line-height:1.35}
+#section-inbox .conversation-number{font-size:12px;color:#526a7b;font-weight:600;margin-top:4px;letter-spacing:.1px}
+#section-inbox .conversation-preview{font-size:12px;color:#607587;margin-top:6px}
+#section-inbox .conversation-meta{font-size:11px;color:#748796}
+#section-inbox .chat{background:#fff}
+#section-inbox .chat-header{min-height:88px;display:flex;align-items:center;padding:17px 24px;background:#fff;border-bottom:1px solid #e8edf1;box-shadow:none;backdrop-filter:none}
+#section-inbox .chat-title{width:100%;align-items:center}
+#section-inbox .chat-name{font-size:18px!important;color:#152d40!important;font-weight:800;line-height:1.3;overflow-wrap:anywhere}
+#section-inbox .chat-number{font-size:14px!important;color:#426176!important;font-weight:650;margin-top:5px;letter-spacing:.25px;overflow-wrap:anywhere}
+#section-inbox .chat-header .stage-pill,#section-inbox .chat-header .pill{font-size:11px}
+#section-inbox .messages{padding:22px clamp(16px,3vw,36px);background:#f7f9fb;background-image:none}
+#section-inbox .message{font-size:13px;line-height:1.55;max-width:min(76%,620px);padding:11px 14px;border-radius:18px;margin-bottom:12px;box-shadow:0 1px 2px rgba(15,35,50,.04);overflow-wrap:anywhere}
+#section-inbox .message.inbound{background:#edf0f3;color:#172b3a;border-bottom-left-radius:5px}
+#section-inbox .message.outbound{background:#dff2ff;color:#102f45;border-bottom-right-radius:5px}
+#section-inbox .message-time{font-size:10px;color:#687f90;margin-top:6px}
+#section-inbox .chat-composer{padding:13px 16px;background:#fff;border-top:1px solid #e7edf2;backdrop-filter:none;gap:10px}
+#section-inbox .chat-composer textarea{height:48px;min-height:48px;border-radius:24px;background:#f5f7f9;border:1px solid #e1e7ec;padding:13px 18px;font-size:13px;color:#162d40}
+#section-inbox .chat-composer .btn{border-radius:22px;min-height:44px}
+/* Notifications stay dismissed for the same incoming message; close button always visible */
+.notif{right:20px;top:92px;width:min(360px,calc(100vw - 40px));padding:16px 44px 15px 16px;border:1px solid #e2eaf0;border-left:4px solid #20a873;border-radius:16px;box-shadow:0 18px 55px rgba(8,29,46,.2)}
+.notif-close{display:flex;align-items:center;justify-content:center;right:9px;top:9px;width:28px;height:28px;background:#e9eff4;color:#203b50;font-size:22px;font-weight:500;z-index:2}
+.notif-close:hover{background:#dbe6ed}
+.notif strong{font-size:13px;color:#172d40}.notif p{font-size:12px;line-height:1.5;color:#526a7c;max-height:110px;overflow:auto}
+/* Sidebar is a stable vertical layout; logout never overlays the navigation labels */
+.sidebar{display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden}
+.sidebar .menu{flex:1 0 auto;padding-bottom:12px}
+.sidebar .sidebar-footer{position:sticky;bottom:0;left:auto;right:auto;flex:0 0 auto;margin:8px 12px 12px;padding:8px;background:#0b263b;border:1px solid rgba(255,255,255,.12);border-radius:13px;z-index:5}
+.sidebar .sidebar-logout{display:flex;width:100%;min-height:42px;align-items:center;gap:6px;justify-content:flex-start;padding:10px 12px;white-space:nowrap;overflow:hidden;font-size:12px;background:rgba(255,255,255,.07);border:0}
+.sidebar .sidebar-logout .menu-text{display:inline!important;overflow:hidden;text-overflow:ellipsis}
+@media(max-width:1050px){.sidebar .sidebar-footer{display:none!important}#section-inbox .inbox{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(170px,30%) minmax(0,1fr);height:calc(100vh - 160px)}#section-inbox .chat-header{min-height:74px;padding:13px 16px}#section-inbox .chat-name{font-size:16px!important}#section-inbox .chat-number{font-size:12px!important}}
+@media(max-width:700px){#section-inbox .inbox{height:calc(100vh - 130px);min-height:460px}#section-inbox .message{max-width:88%;font-size:12px}#section-inbox .chat-composer{padding:9px;gap:6px}}
 </style>
